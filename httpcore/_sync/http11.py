@@ -13,6 +13,7 @@ from .._backends.base import NetworkStream
 from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
+    ReadTimeout,
     RemoteProtocolError,
     WriteError,
     map_exceptions,
@@ -79,13 +80,14 @@ class HTTP11Connection(ConnectionInterface):
 
         try:
             kwargs = {"request": request}
+            early_response = None
             try:
                 with Trace(
                     "send_request_headers", logger, request, kwargs
                 ) as trace:
                     self._send_request_headers(**kwargs)
                 with Trace("send_request_body", logger, request, kwargs) as trace:
-                    self._send_request_body(**kwargs)
+                    early_response = self._send_request_body(**kwargs)
             except WriteError:
                 # If we get a write error while we're writing the request,
                 # then we supress this error and move on to attempting to
@@ -103,7 +105,9 @@ class HTTP11Connection(ConnectionInterface):
                     reason_phrase,
                     headers,
                     trailing_data,
-                ) = self._receive_response_headers(**kwargs)
+                ) = self._receive_response_headers(
+                    request, early_response=early_response
+                )
                 trace.return_value = (
                     http_version,
                     status,
@@ -149,16 +153,72 @@ class HTTP11Connection(ConnectionInterface):
             )
         self._send_event(event, timeout=timeout)
 
-    def _send_request_body(self, request: Request) -> None:
+    def _send_request_body(self, request: Request) -> h11.Event | None:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("write", None)
 
-        assert isinstance(request.stream, typing.Iterable)
-        for chunk in request.stream:
-            event = h11.Data(data=chunk)
-            self._send_event(event, timeout=timeout)
+        early_response = self._receive_100_continue(request)
+        if early_response is not None:
+            return early_response
 
-        self._send_event(h11.EndOfMessage(), timeout=timeout)
+        assert isinstance(request.stream, typing.Iterable)
+        stream = iter(request.stream)
+        try:
+            for chunk in stream:
+                event = h11.Data(data=chunk)
+                self._send_event(event, timeout=timeout)
+
+            self._send_event(h11.EndOfMessage(), timeout=timeout)
+        except BaseException:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+            raise
+
+        return None
+
+    def _receive_100_continue(self, request: Request) -> h11.Event | None:
+        if not self._expects_100_continue(request):
+            return None
+
+        timeouts = request.extensions.get("timeout", {})
+        timeout = timeouts.get("expect_continue", timeouts.get("read", None))
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        while True:
+            if deadline is None:
+                read_timeout = None
+            else:
+                read_timeout = max(0.0, deadline - time.monotonic())
+
+            try:
+                event = self._receive_event(timeout=read_timeout)
+            except ReadTimeout:
+                return None
+
+            if isinstance(event, h11.InformationalResponse):
+                if event.status_code in (100, 101):
+                    return None if event.status_code == 100 else event
+                continue
+            if isinstance(event, h11.Response):
+                return event
+
+            raise RemoteProtocolError(
+                "Unexpected event while waiting for 100 Continue"
+            )
+
+    @staticmethod
+    def _expects_100_continue(request: Request) -> bool:
+        for name, value in request.headers:
+            if name.lower() != b"expect":
+                continue
+            expectations = (
+                expectation.strip().lower()
+                for expectation in value.split(b",")
+            )
+            if b"100-continue" in expectations:
+                return True
+        return False
 
     def _send_event(self, event: h11.Event, timeout: float | None = None) -> None:
         bytes_to_send = self._h11_state.send(event)
@@ -168,20 +228,25 @@ class HTTP11Connection(ConnectionInterface):
     # Receiving the response...
 
     def _receive_response_headers(
-        self, request: Request
+        self,
+        request: Request,
+        early_response: h11.Event | None = None,
     ) -> tuple[bytes, int, bytes, list[tuple[bytes, bytes]], bytes]:
-        timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("read", None)
+        if early_response is None:
+            timeouts = request.extensions.get("timeout", {})
+            timeout = timeouts.get("read", None)
 
-        while True:
-            event = self._receive_event(timeout=timeout)
-            if isinstance(event, h11.Response):
-                break
-            if (
-                isinstance(event, h11.InformationalResponse)
-                and event.status_code == 101
-            ):
-                break
+            while True:
+                event = self._receive_event(timeout=timeout)
+                if isinstance(event, h11.Response):
+                    break
+                if (
+                    isinstance(event, h11.InformationalResponse)
+                    and event.status_code == 101
+                ):
+                    break
+        else:
+            event = early_response
 
         http_version = b"HTTP/" + event.http_version
 

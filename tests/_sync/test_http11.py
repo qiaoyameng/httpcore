@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 import httpcore
@@ -233,6 +235,246 @@ def test_http11_expect_continue():
         assert response.status == 200
         assert response.content == b"Hello, world!"
 
+
+
+class ExpectContinueBody:
+    def __init__(self) -> None:
+        self.first_read_at: float | None = None
+        self.read_count = 0
+        self.closed = False
+
+    def __iter__(self) -> "ExpectContinueBody":
+        return self
+
+    def __next__(self) -> bytes:
+        if self.read_count:
+            raise StopIteration
+        self.first_read_at = time.monotonic()
+        self.read_count += 1
+        return b"Hello, world!"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ExpectContinueStream(httpcore.NetworkStream):
+    def __init__(self, responses: list[bytes], *, fail_body_write: bool = False):
+        self._responses = responses
+        self._fail_body_write = fail_body_write
+        self.header_write_count = 0
+        self.body_write_count = 0
+        self.closed = False
+        self.continue_at: float | None = None
+        self.final_response_at: float | None = None
+        self.timeout_at: float | None = None
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        if not self._responses:
+            self.timeout_at = time.monotonic()
+            raise httpcore.ReadTimeout()
+        response = self._responses.pop(0)
+        if response.startswith(b"HTTP/1.1 100"):
+            self.continue_at = time.monotonic()
+        elif response.startswith(b"HTTP/1.1 4"):
+            self.final_response_at = time.monotonic()
+        return response
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        if self.header_write_count == 0:
+            self.header_write_count = 1
+        elif self._fail_body_write and buffer != b"0\r\n\r\n":
+            raise httpcore.WriteError()
+        elif buffer != b"0\r\n\r\n":
+            self.body_write_count += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+    def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+        return self
+
+    def get_extra_info(self, info):
+        return None
+
+
+class TimeoutThenContinueStream(ExpectContinueStream):
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        response = self._responses.pop(0)
+        if response == b"timeout":
+            self.timeout_at = time.monotonic()
+            raise httpcore.ReadTimeout()
+        if response.startswith(b"HTTP/1.1 100"):
+            self.continue_at = time.monotonic()
+        return response
+
+
+class EarlyHintsThenTimedOutStream(ExpectContinueStream):
+    def __init__(self):
+        super().__init__([])
+        self._stage = 0
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        if self._stage == 0:
+            self._stage = 1
+            time.sleep(0.01)
+            return b"HTTP/1.1 103 Early Hints\r\n\r\n"
+        if self._stage == 1:
+            self._stage = 2
+            assert timeout is not None
+            assert timeout < 0.04
+            self.timeout_at = time.monotonic()
+            raise httpcore.ReadTimeout()
+        return b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+
+def test_http11_expect_continue_waits_for_100():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ]
+    )
+    body = ExpectContinueBody()
+
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=body,
+            extensions={"timeout": {"read": 10.0}},
+        )
+        response.close()
+
+    assert response.status == 200
+    assert stream.continue_at is not None
+    assert body.read_count == 1
+    assert body.first_read_at is not None
+    assert body.first_read_at >= stream.continue_at
+
+
+def test_http11_expect_continue_early_rejection_does_not_read_body():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n"]
+    )
+    body = ExpectContinueBody()
+
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=body,
+            extensions={"timeout": {"read": 10.0}},
+        )
+        response.close()
+
+    assert response.status == 413
+    assert stream.final_response_at is not None
+    assert stream.body_write_count == 0
+    assert body.read_count == 0
+    assert body.first_read_at is None
+    assert not body.closed
+
+
+def test_http11_expect_continue_unauthorized_does_not_read_body():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"]
+    )
+    body = ExpectContinueBody()
+
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=body,
+            extensions={"timeout": {"read": 10.0}},
+        )
+        response.close()
+
+    assert response.status == 401
+    assert stream.body_write_count == 0
+    assert body.read_count == 0
+    assert body.first_read_at is None
+
+
+def test_http11_expect_continue_early_hints_does_not_reset_timeout():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = EarlyHintsThenTimedOutStream()
+    body = ExpectContinueBody()
+
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=body,
+            extensions={"timeout": {"expect_continue": 0.05, "read": 10.0}},
+        )
+        response.close()
+
+    assert response.status == 200
+    assert stream.timeout_at is not None
+    assert stream.body_write_count == 1
+    assert body.read_count == 1
+
+
+def test_http11_expect_continue_timeout_then_100_starts_body_once():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = TimeoutThenContinueStream(
+        [
+            b"timeout",
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ]
+    )
+    body = ExpectContinueBody()
+
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=body,
+            extensions={"timeout": {"expect_continue": 0.01}},
+        )
+        response.close()
+
+    assert response.status == 200
+    assert stream.timeout_at is not None
+    assert body.read_count == 1
+    assert body.first_read_at is not None
+    assert body.first_read_at >= stream.timeout_at
+
+
+def test_http11_expect_continue_write_failure_closes_started_body():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n",
+        ],
+        fail_body_write=True,
+    )
+    body = ExpectContinueBody()
+
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=body,
+            extensions={"timeout": {"read": 10.0}},
+        )
+        response.close()
+
+    assert response.status == 413
+    assert body.read_count == 1
+    assert body.closed
 
 
 def test_http11_upgrade_connection():
