@@ -14,5 +14,6 @@ The following exceptions may be raised when sending a request:
 * `httpcore.ProtocolError`
     * `httpcore.RemoteProtocolError`
     * `httpcore.LocalProtocolError`
+* `httpcore.RequestNotReplayable`
 * `httpcore.ProxyError`
 * `httpcore.UnsupportedProtocol`

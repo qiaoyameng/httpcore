@@ -29,6 +29,7 @@ from ._exceptions import (
     ReadError,
     ReadTimeout,
     RemoteProtocolError,
+    RequestNotReplayable,
     TimeoutException,
     UnsupportedProtocol,
     WriteError,
@@ -115,6 +116,7 @@ __all__ = [
     "SOCKET_OPTION",
     # exceptions
     "ConnectionNotAvailable",
+    "RequestNotReplayable",
     "ProxyError",
     "ProtocolError",
     "LocalProtocolError",

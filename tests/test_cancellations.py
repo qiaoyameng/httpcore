@@ -207,6 +207,28 @@ async def test_h2_timeout_during_request():
         assert conn.is_idle()
 
 
+@pytest.mark.anyio
+async def test_h2_goaway_cancellation_during_response():
+    """
+    An async timeout on an HTTP/2 request that is still being processed
+    after a GOAWAY frame should exit cleanly, closing the connection.
+    """
+    origin = httpcore.Origin(b"http", b"example.com", 80)
+    stream = SlowReadStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.GoAwayFrame(
+                stream_id=0, error_code=0, last_stream_id=1
+            ).serialize(),
+        ]
+    )
+    async with httpcore.AsyncHTTP2Connection(origin, stream) as conn:
+        with anyio.move_on_after(0.01):
+            await conn.request("GET", "http://example.com")
+
+        assert conn.is_closed()
+
+
 @pytest.mark.xfail
 @pytest.mark.anyio
 async def test_h2_timeout_during_response():

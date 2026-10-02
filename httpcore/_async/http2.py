@@ -17,13 +17,20 @@ from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
     RemoteProtocolError,
+    RequestNotReplayable,
 )
-from .._models import Origin, Request, Response
+from .._models import ByteStream, Origin, Request, Response
 from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
 from .._trace import Trace
 from .interfaces import AsyncConnectionInterface
 
 logger = logging.getLogger("httpcore.http2")
+
+# The maximum number of times a request may be replayed onto a new
+# connection following GOAWAY frames. This ensures that a server that
+# persistently refuses to process a request results in a finite,
+# diagnosable failure, rather than an endless retry loop.
+MAX_GOAWAY_REPLAYS = 2
 
 
 def has_body_headers(request: Request) -> bool:
@@ -31,6 +38,31 @@ def has_body_headers(request: Request) -> bool:
         k.lower() == b"content-length" or k.lower() == b"transfer-encoding"
         for k, v in request.headers
     )
+
+
+def request_body_is_replayable(request: Request) -> bool:
+    """
+    Determine if a request body can be replayed onto a new connection.
+
+    Bodies given as `bytes` or as re-iterable streams can be regenerated
+    from the start. One-shot iterators cannot, since the content has
+    already been consumed.
+    """
+    stream = request.stream
+    if isinstance(stream, ByteStream):
+        return True
+    return not hasattr(stream, "__next__") and not hasattr(stream, "__anext__")
+
+
+class StreamNotProcessed(Exception):
+    """
+    Internal exception used when a GOAWAY frame indicates that the server
+    has not processed, and will not process, a given stream.
+    """
+
+    def __init__(self, stream_id: int, last_stream_id: int) -> None:
+        self.stream_id = stream_id
+        self.last_stream_id = last_stream_id
 
 
 class HTTPConnectionState(enum.IntEnum):
@@ -101,6 +133,14 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             else:
                 raise ConnectionNotAvailable()
 
+        if self._connection_terminated is not None:
+            # A GOAWAY frame has already been received, so this connection
+            # is draining and cannot accept any new requests. Nothing has
+            # been sent yet, so the request can safely be resent on another
+            # connection.
+            self._request_count -= 1
+            self._replay_request(request)
+
         async with self._init_lock:
             if not self._sent_connection_init:
                 try:
@@ -138,11 +178,13 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             self._request_count -= 1
             raise ConnectionNotAvailable()
 
+        sent_request_body = False
         try:
             kwargs = {"request": request, "stream_id": stream_id}
             async with Trace("send_request_headers", logger, request, kwargs):
                 await self._send_request_headers(request=request, stream_id=stream_id)
             async with Trace("send_request_body", logger, request, kwargs):
+                sent_request_body = has_body_headers(request)
                 await self._send_request_body(request=request, stream_id=stream_id)
             async with Trace(
                 "receive_response_headers", logger, request, kwargs
@@ -162,6 +204,35 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                     "stream_id": stream_id,
                 },
             )
+        except StreamNotProcessed:
+            # The server sent a GOAWAY frame indicating that this request
+            # was not processed. If the request body was not consumed then
+            # the request can always be resent on a new connection. If the
+            # body was consumed, then the request is only replayed if the
+            # caller has explicitly opted-in via the 'allow_replay' request
+            # extension, and the body can be regenerated. We don't make any
+            # assumptions about idempotency based on the request method.
+            with AsyncShieldCancellation():
+                kwargs = {"stream_id": stream_id}
+                async with Trace("response_closed", logger, request, kwargs):
+                    await self._response_closed(stream_id=stream_id)
+
+            if not sent_request_body:
+                self._replay_request(request)
+            elif not request.extensions.get("allow_replay", False):
+                raise RequestNotReplayable(
+                    "The request body was already sent, and the request does "
+                    "not allow replays. Use the 'allow_replay' request "
+                    "extension to enable replaying requests that are "
+                    "interrupted by a GOAWAY frame."
+                )
+            elif not request_body_is_replayable(request):
+                raise RequestNotReplayable(
+                    "The request body was already sent, and cannot be "
+                    "regenerated to replay the request."
+                )
+            else:
+                self._replay_request(request)
         except BaseException as exc:  # noqa: PIE786
             with AsyncShieldCancellation():
                 kwargs = {"stream_id": stream_id}
@@ -185,6 +256,24 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 raise LocalProtocolError(exc)  # pragma: nocover
 
             raise exc
+
+    def _replay_request(self, request: Request) -> typing.NoReturn:
+        """
+        Raise `ConnectionNotAvailable` so that the connection pool resends
+        the request on a new connection.
+
+        The number of replays is bounded, so that a server that persistently
+        sends GOAWAY frames without processing the request results in a
+        finite, diagnosable failure rather than an endless retry loop.
+        """
+        replays = request.extensions.get("goaway_replays", 0)
+        if replays >= MAX_GOAWAY_REPLAYS:
+            raise RemoteProtocolError(
+                "Server sent repeated GOAWAY frames without processing the "
+                "request, and the replay limit was reached."
+            )
+        request.extensions["goaway_replays"] = replays + 1
+        raise ConnectionNotAvailable()
 
     async def _send_connection_init(self, request: Request) -> None:
         """
@@ -349,10 +438,14 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         async with self._read_lock:
             if self._connection_terminated is not None:
                 last_stream_id = self._connection_terminated.last_stream_id
-                if stream_id and last_stream_id and stream_id > last_stream_id:
+                if stream_id is not None and stream_id > last_stream_id:
+                    # The server has indicated that it has not processed
+                    # this stream, and will not do so. The request may be
+                    # resent on a new connection.
                     self._request_count -= 1
-                    raise ConnectionNotAvailable()
-                raise RemoteProtocolError(self._connection_terminated)
+                    raise StreamNotProcessed(stream_id, last_stream_id)
+                # Streams at or below 'last_stream_id' are still being
+                # processed by the server, and continue to completion.
 
             # This conditional is a bit icky. We don't want to block reading if we've
             # actually got an event to return for a given stream. We need to do that
@@ -383,6 +476,17 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                             self._events[event.stream_id].append(event)
 
                     elif isinstance(event, h2.events.ConnectionTerminated):
+                        previous_termination = self._connection_terminated
+                        if previous_termination is not None and (
+                            event.last_stream_id > previous_termination.last_stream_id
+                        ):
+                            # Servers MUST NOT increase the last stream ID
+                            # in subsequent GOAWAY frames. (RFC 7540, 6.8)
+                            self._connection_error = True
+                            raise RemoteProtocolError(
+                                "Server sent a GOAWAY frame with an increased "
+                                "last_stream_id."
+                            )
                         self._connection_terminated = event
 
         await self._write_outgoing_data(request)
@@ -438,6 +542,16 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             raise self._read_exception  # pragma: nocover
 
         try:
+            if self._connection_terminated is not None:
+                # The 'h2' state machine considers the connection closed as
+                # soon as a GOAWAY frame has been received, but the server
+                # may still send frames for streams at or below the GOAWAY
+                # 'last_stream_id'. Re-open the state machine so that those
+                # frames can be processed, allowing any streams that are
+                # still being processed to continue to completion.
+                self._h2_state.state_machine.state = (
+                    h2.connection.ConnectionState.CLIENT_OPEN
+                )
             data = await self._network_stream.read(self.READ_NUM_BYTES, timeout)
             if data == b"":
                 raise RemoteProtocolError("Server disconnected")
@@ -497,6 +611,16 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         max_frame_size: int = self._h2_state.max_outbound_frame_size
         flow = min(local_flow, max_frame_size)
         while flow == 0:
+            if (
+                self._connection_terminated is not None
+                and stream_id > self._connection_terminated.last_stream_id
+            ):
+                # The server has indicated that it will not process this
+                # stream, so no further flow control updates will arrive.
+                self._request_count -= 1
+                raise StreamNotProcessed(
+                    stream_id, self._connection_terminated.last_stream_id
+                )
             await self._receive_events(request)
             local_flow = self._h2_state.local_flow_control_window(stream_id)
             max_frame_size = self._h2_state.max_outbound_frame_size
@@ -513,6 +637,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             self._state != HTTPConnectionState.CLOSED
             and not self._connection_error
             and not self._used_all_stream_ids
+            and self._connection_terminated is None
             and not (
                 self._h2_state.state_machine.state
                 == h2.connection.ConnectionState.CLOSED
@@ -576,6 +701,16 @@ class HTTP2ConnectionByteStream:
                     request=self._request, stream_id=self._stream_id
                 ):
                     yield chunk
+        except StreamNotProcessed as exc:
+            # A GOAWAY frame interrupted the response partway through.
+            # The response has already been returned to the caller, so the
+            # request cannot be replayed onto a new connection.
+            with AsyncShieldCancellation():
+                await self.aclose()
+            raise RemoteProtocolError(
+                "Connection terminated by a GOAWAY frame partway through "
+                "the response."
+            ) from exc
         except BaseException as exc:
             # If we get an exception while streaming the response,
             # we want to close the response (and possibly the connection)

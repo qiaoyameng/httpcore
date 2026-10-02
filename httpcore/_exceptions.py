@@ -19,6 +19,10 @@ class ConnectionNotAvailable(Exception):
     pass
 
 
+class RequestNotReplayable(Exception):
+    pass
+
+
 class ProxyError(Exception):
     pass
 

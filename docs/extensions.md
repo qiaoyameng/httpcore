@@ -188,6 +188,36 @@ response = httpcore.request(
 )
 ```
 
+### `"allow_replay"`
+
+A boolean indicating that the request may be replayed onto a new connection
+if the server sends an HTTP/2 `GOAWAY` frame before processing it.
+
+When a `GOAWAY` frame is received, any request with a stream ID above the
+`last_stream_id` was definitely not processed by the server. If the request
+body has not been consumed, then the request is always moved onto a new
+connection. If the request body was already sent, then the request is only
+replayed when `"allow_replay"` is set, and the body can be regenerated
+(for example, `bytes` content, rather than a one-shot iterator). Otherwise
+a `httpcore.RequestNotReplayable` exception is raised.
+
+Replays are never inferred from the request method, since `httpcore` cannot
+know which requests are idempotent in your application. The number of replay
+attempts is bounded, so a server that persistently refuses to process a
+request results in a `httpcore.RemoteProtocolError` rather than an endless
+retry loop.
+
+For example:
+
+```python
+response = httpcore.request(
+    "POST",
+    "https://www.example.com/",
+    content=b'{"data": "upload"}',
+    extensions={"allow_replay": True}
+)
+```
+
 ## Response Extensions
 
 ### `"http_version"`

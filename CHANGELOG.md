@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Handle HTTP/2 `GOAWAY` frames more gracefully. Streams at or below the
+  `last_stream_id` now continue to completion, and requests that the server
+  did not process are moved onto a new connection. Requests with a consumed
+  body are only replayed when the `"allow_replay"` request extension is set
+  and the body can be regenerated, otherwise `httpcore.RequestNotReplayable`
+  is raised. Replay attempts are bounded, failing with
+  `httpcore.RemoteProtocolError` if the server persistently refuses the
+  request.
 
 ## Version 1.0.9 (April 24th, 2025)
 
