@@ -8,7 +8,7 @@ import typing
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
 from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
-from .._models import Origin, Proxy, Request, Response
+from .._models import NetworkOverride, Origin, Proxy, Request, Response
 from .._synchronization import AsyncEvent, AsyncShieldCancellation, AsyncThreadLock
 from .connection import AsyncHTTPConnection
 from .interfaces import AsyncConnectionInterface, AsyncRequestInterface
@@ -125,8 +125,18 @@ class AsyncConnectionPool(AsyncRequestInterface):
         # in which case it is a no-op.
         self._optional_thread_lock = AsyncThreadLock()
 
-    def create_connection(self, origin: Origin) -> AsyncConnectionInterface:
+    def create_connection(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> AsyncConnectionInterface:
         if self._proxy is not None:
+            if network_override is not None and network_override.applies_to is None:
+                raise ValueError(
+                    "Requests via a proxy must set 'applies_to' on any network "
+                    "override, to indicate if the override targets the proxy "
+                    "address or the tunnel target."
+                )
             if self._proxy.url.scheme in (b"socks5", b"socks5h"):
                 from .socks_proxy import AsyncSocks5Connection
 
@@ -138,6 +148,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                     keepalive_expiry=self._keepalive_expiry,
                     http1=self._http1,
                     http2=self._http2,
+                    network_override=network_override,
                     network_backend=self._network_backend,
                 )
             elif origin.scheme == b"http":
@@ -149,6 +160,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                     proxy_ssl_context=self._proxy.ssl_context,
                     remote_origin=origin,
                     keepalive_expiry=self._keepalive_expiry,
+                    network_override=network_override,
                     network_backend=self._network_backend,
                 )
             from .http_proxy import AsyncTunnelHTTPConnection
@@ -162,9 +174,15 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 keepalive_expiry=self._keepalive_expiry,
                 http1=self._http1,
                 http2=self._http2,
+                network_override=network_override,
                 network_backend=self._network_backend,
             )
 
+        if network_override is not None and network_override.applies_to == "proxy":
+            raise ValueError(
+                "A network override with 'applies_to=\"proxy\"' requires "
+                "a pool configured with a proxy."
+            )
         return AsyncHTTPConnection(
             origin=origin,
             ssl_context=self._ssl_context,
@@ -174,6 +192,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
             retries=self._retries,
             local_address=self._local_address,
             uds=self._uds,
+            network_override=network_override,
             network_backend=self._network_backend,
             socket_options=self._socket_options,
         )
@@ -210,6 +229,15 @@ class AsyncConnectionPool(AsyncRequestInterface):
         if scheme not in ("http", "https", "ws", "wss"):
             raise UnsupportedProtocol(
                 f"Request URL has an unsupported protocol '{scheme}://'."
+            )
+
+        network_override = request.extensions.get("network_override")
+        if network_override is not None and not isinstance(
+            network_override, NetworkOverride
+        ):
+            raise TypeError(
+                "The 'network_override' extension must be a "
+                "'httpcore.NetworkOverride' instance."
             )
 
         timeouts = request.extensions.get("timeout", {})
@@ -302,10 +330,12 @@ class AsyncConnectionPool(AsyncRequestInterface):
         queued_requests = [request for request in self._requests if request.is_queued()]
         for pool_request in queued_requests:
             origin = pool_request.request.url.origin
+            network_override = pool_request.request.extensions.get("network_override")
             available_connections = [
                 connection
                 for connection in self._connections
-                if connection.can_handle_request(origin) and connection.is_available()
+                if connection.can_handle_request(origin, network_override)
+                and connection.is_available()
             ]
             idle_connections = [
                 connection for connection in self._connections if connection.is_idle()
@@ -323,7 +353,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 pool_request.assign_to_connection(connection)
             elif len(self._connections) < self._max_connections:
                 # log: "creating new connection"
-                connection = self.create_connection(origin)
+                connection = self.create_connection(origin, network_override)
                 self._connections.append(connection)
                 pool_request.assign_to_connection(connection)
             elif idle_connections:
@@ -332,7 +362,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 self._connections.remove(connection)
                 closing_connections.append(connection)
                 # log: "creating new connection"
-                connection = self.create_connection(origin)
+                connection = self.create_connection(origin, network_override)
                 self._connections.append(connection)
                 pool_request.assign_to_connection(connection)
 

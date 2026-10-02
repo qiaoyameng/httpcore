@@ -9,7 +9,7 @@ import typing
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
 from .._exceptions import ConnectError, ConnectTimeout
-from .._models import Origin, Request, Response
+from .._models import NetworkOverride, Origin, Request, Response
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
@@ -46,6 +46,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         retries: int = 0,
         local_address: str | None = None,
         uds: str | None = None,
+        network_override: NetworkOverride | None = None,
         network_backend: AsyncNetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
     ) -> None:
@@ -57,6 +58,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         self._retries = retries
         self._local_address = local_address
         self._uds = uds
+        self._network_override = network_override
 
         self._network_backend: AsyncNetworkBackend = (
             AutoBackend() if network_backend is None else network_backend
@@ -67,7 +69,9 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         self._socket_options = socket_options
 
     async def handle_async_request(self, request: Request) -> Response:
-        if not self.can_handle_request(request.url.origin):
+        if not self.can_handle_request(
+            request.url.origin, request.extensions.get("network_override")
+        ):
             raise RuntimeError(
                 f"Attempted to send request to {request.url.origin} on connection to {self._origin}"
             )
@@ -110,12 +114,30 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         retries_left = self._retries
         delays = exponential_backoff(factor=RETRIES_BACKOFF_FACTOR)
 
+        # A request-level network override only changes the destination the
+        # connection is opened to. The HTTP origin is unaffected, so the
+        # `Host` header, SNI hostname, and TLS certificate verification all
+        # continue to use the request URL.
+        override = self._network_override
+        if override is not None and override.uds is not None:
+            uds = override.uds
+        elif override is not None:
+            # A TCP override takes precedence over any connection-level `uds`.
+            uds = None
+        else:
+            uds = self._uds
+
         while True:
             try:
-                if self._uds is None:
+                if uds is None:
+                    host = self._origin.host.decode("ascii")
+                    port = self._origin.port
+                    if override is not None:
+                        host = override.host or host
+                        port = override.port or port
                     kwargs = {
-                        "host": self._origin.host.decode("ascii"),
-                        "port": self._origin.port,
+                        "host": host,
+                        "port": port,
                         "local_address": self._local_address,
                         "timeout": timeout,
                         "socket_options": self._socket_options,
@@ -125,7 +147,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                         trace.return_value = stream
                 else:
                     kwargs = {
-                        "path": self._uds,
+                        "path": uds,
                         "timeout": timeout,
                         "socket_options": self._socket_options,
                     }
@@ -164,8 +186,12 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                 async with Trace("retry", logger, request, kwargs) as trace:
                     await self._network_backend.sleep(delay)
 
-    def can_handle_request(self, origin: Origin) -> bool:
-        return origin == self._origin
+    def can_handle_request(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> bool:
+        return origin == self._origin and network_override == self._network_override
 
     async def aclose(self) -> None:
         if self._connection is not None:

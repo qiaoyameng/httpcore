@@ -7,6 +7,7 @@ from .._models import (
     URL,
     Extensions,
     HeaderTypes,
+    NetworkOverride,
     Origin,
     Request,
     Response,
@@ -91,7 +92,11 @@ class ConnectionInterface(RequestInterface):
     def info(self) -> str:
         raise NotImplementedError()  # pragma: nocover
 
-    def can_handle_request(self, origin: Origin) -> bool:
+    def can_handle_request(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> bool:
         raise NotImplementedError()  # pragma: nocover
 
     def is_available(self) -> bool:

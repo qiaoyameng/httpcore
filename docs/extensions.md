@@ -166,6 +166,38 @@ response = httpcore.request(
 )
 ```
 
+### `"network_override"`
+
+A per-request override of the network destination used when establishing the
+connection, given as an `httpcore.NetworkOverride` instance.
+
+The override only changes which address and port the underlying connection is
+opened to. The HTTP origin is left unchanged, so the `Host` header, the SNI
+hostname, and TLS certificate verification all continue to use the request
+URL. This is useful for gray-release or canary probing, where a request needs
+to be directed at a specific server IP without rewriting the URL:
+
+``` python
+extensions = {"network_override": httpcore.NetworkOverride(host="10.0.0.1", port=8443)}
+response = httpcore.request("GET", "https://www.example.com", extensions=extensions)
+```
+
+Instead of a TCP `host`/`port`, a Unix domain socket may be given as
+`uds="/path/to/socket"`. The two styles cannot be combined.
+
+Network overrides are part of the connection pool identity: requests with
+different override values are never placed on the same reusable connection.
+
+When requests are sent via a proxy, `applies_to` must be set explicitly to
+indicate if the override targets the proxy address or the tunnel target:
+
+``` python
+# Connect to the proxy at a different address...
+httpcore.NetworkOverride(host="10.0.0.1", port=8080, applies_to="proxy")
+# ...or retarget the proxy CONNECT tunnel itself.
+httpcore.NetworkOverride(host="10.0.0.9", port=443, applies_to="origin")
+```
+
 ### `"target"`
 
 The target that is used as [the HTTP target instead of the URL path](https://datatracker.ietf.org/doc/html/rfc2616#section-5.1.2).

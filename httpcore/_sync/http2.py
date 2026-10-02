@@ -18,7 +18,7 @@ from .._exceptions import (
     LocalProtocolError,
     RemoteProtocolError,
 )
-from .._models import Origin, Request, Response
+from .._models import NetworkOverride, Origin, Request, Response
 from .._synchronization import Lock, Semaphore, ShieldCancellation
 from .._trace import Trace
 from .interfaces import ConnectionInterface
@@ -505,7 +505,11 @@ class HTTP2Connection(ConnectionInterface):
 
     # Interface for connection pooling...
 
-    def can_handle_request(self, origin: Origin) -> bool:
+    def can_handle_request(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> bool:
         return origin == self._origin
 
     def is_available(self) -> bool:

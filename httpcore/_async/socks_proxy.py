@@ -8,7 +8,15 @@ import socksio
 from .._backends.auto import AutoBackend
 from .._backends.base import AsyncNetworkBackend, AsyncNetworkStream
 from .._exceptions import ConnectionNotAvailable, ProxyError
-from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
+from .._models import (
+    URL,
+    NetworkOverride,
+    Origin,
+    Request,
+    Response,
+    enforce_bytes,
+    enforce_url,
+)
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
@@ -173,7 +181,17 @@ class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
         else:
             self._proxy_auth = None
 
-    def create_connection(self, origin: Origin) -> AsyncConnectionInterface:
+    def create_connection(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> AsyncConnectionInterface:
+        if network_override is not None and network_override.applies_to is None:
+            raise ValueError(
+                "Requests via a proxy must set 'applies_to' on any network "
+                "override, to indicate if the override targets the proxy "
+                "address or the origin."
+            )
         return AsyncSocks5Connection(
             proxy_origin=self._proxy_url.origin,
             remote_origin=origin,
@@ -182,6 +200,7 @@ class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
             keepalive_expiry=self._keepalive_expiry,
             http1=self._http1,
             http2=self._http2,
+            network_override=network_override,
             network_backend=self._network_backend,
         )
 
@@ -196,8 +215,23 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
         keepalive_expiry: float | None = None,
         http1: bool = True,
         http2: bool = False,
+        network_override: NetworkOverride | None = None,
         network_backend: AsyncNetworkBackend | None = None,
     ) -> None:
+        if network_override is not None:
+            if network_override.applies_to is None:
+                raise ValueError(
+                    "Requests via a proxy must set 'applies_to' on any "
+                    "network override, to indicate if the override targets "
+                    "the proxy address or the origin."
+                )
+            if network_override.applies_to == "origin" and (
+                network_override.uds is not None
+            ):
+                raise ValueError(
+                    "A Unix domain socket network override cannot be applied "
+                    "to a SOCKS5 target."
+                )
         self._proxy_origin = proxy_origin
         self._remote_origin = remote_origin
         self._proxy_auth = proxy_auth
@@ -205,6 +239,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
         self._keepalive_expiry = keepalive_expiry
         self._http1 = http1
         self._http2 = http2
+        self._network_override = network_override
 
         self._network_backend: AsyncNetworkBackend = (
             AutoBackend() if network_backend is None else network_backend
@@ -222,20 +257,55 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
             if self._connection is None:
                 try:
                     # Connect to the proxy
-                    kwargs = {
-                        "host": self._proxy_origin.host.decode("ascii"),
-                        "port": self._proxy_origin.port,
-                        "timeout": timeout,
-                    }
-                    async with Trace("connect_tcp", logger, request, kwargs) as trace:
-                        stream = await self._network_backend.connect_tcp(**kwargs)
-                        trace.return_value = stream
+                    override = self._network_override
+                    proxy_override = (
+                        override
+                        if override is not None and override.applies_to == "proxy"
+                        else None
+                    )
+                    if proxy_override is not None and proxy_override.uds is not None:
+                        kwargs = {
+                            "path": proxy_override.uds,
+                            "timeout": timeout,
+                        }
+                        async with Trace(
+                            "connect_unix_socket", logger, request, kwargs
+                        ) as trace:
+                            stream = await self._network_backend.connect_unix_socket(
+                                **kwargs
+                            )
+                            trace.return_value = stream
+                    else:
+                        host = self._proxy_origin.host.decode("ascii")
+                        port = self._proxy_origin.port
+                        if proxy_override is not None:
+                            host = proxy_override.host or host
+                            port = proxy_override.port or port
+                        kwargs = {
+                            "host": host,
+                            "port": port,
+                            "timeout": timeout,
+                        }
+                        async with Trace(
+                            "connect_tcp", logger, request, kwargs
+                        ) as trace:
+                            stream = await self._network_backend.connect_tcp(**kwargs)
+                            trace.return_value = stream
 
                     # Connect to the remote host using socks5
+                    # A network override with 'applies_to="origin"' retargets
+                    # the address requested from the SOCKS5 server. The HTTP
+                    # origin is unaffected, so TLS verification and the `Host`
+                    # header still use the request URL.
+                    target_host = self._remote_origin.host.decode("ascii")
+                    target_port = self._remote_origin.port
+                    if override is not None and override.applies_to == "origin":
+                        target_host = override.host or target_host
+                        target_port = override.port or target_port
                     kwargs = {
                         "stream": stream,
-                        "host": self._remote_origin.host.decode("ascii"),
-                        "port": self._remote_origin.port,
+                        "host": target_host,
+                        "port": target_port,
                         "auth": self._proxy_auth,
                     }
                     async with Trace(
@@ -298,8 +368,14 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
 
         return await self._connection.handle_async_request(request)
 
-    def can_handle_request(self, origin: Origin) -> bool:
-        return origin == self._remote_origin
+    def can_handle_request(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> bool:
+        return origin == self._remote_origin and network_override == (
+            self._network_override
+        )
 
     async def aclose(self) -> None:
         if self._connection is not None:

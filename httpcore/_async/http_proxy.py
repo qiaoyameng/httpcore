@@ -9,6 +9,7 @@ from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
 from .._exceptions import ProxyError
 from .._models import (
     URL,
+    NetworkOverride,
     Origin,
     Request,
     Response,
@@ -143,13 +144,24 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
                 (b"Proxy-Authorization", authorization)
             ] + self._proxy_headers
 
-    def create_connection(self, origin: Origin) -> AsyncConnectionInterface:
+    def create_connection(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> AsyncConnectionInterface:
+        if network_override is not None and network_override.applies_to is None:
+            raise ValueError(
+                "Requests via a proxy must set 'applies_to' on any network "
+                "override, to indicate if the override targets the proxy "
+                "address or the tunnel target."
+            )
         if origin.scheme == b"http":
             return AsyncForwardHTTPConnection(
                 proxy_origin=self._proxy_url.origin,
                 proxy_headers=self._proxy_headers,
                 remote_origin=origin,
                 keepalive_expiry=self._keepalive_expiry,
+                network_override=network_override,
                 network_backend=self._network_backend,
                 proxy_ssl_context=self._proxy_ssl_context,
             )
@@ -162,6 +174,7 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
             keepalive_expiry=self._keepalive_expiry,
             http1=self._http1,
             http2=self._http2,
+            network_override=network_override,
             network_backend=self._network_backend,
         )
 
@@ -173,13 +186,28 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
         remote_origin: Origin,
         proxy_headers: HeadersAsMapping | HeadersAsSequence | None = None,
         keepalive_expiry: float | None = None,
+        network_override: NetworkOverride | None = None,
         network_backend: AsyncNetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
         proxy_ssl_context: ssl.SSLContext | None = None,
     ) -> None:
+        if network_override is not None:
+            if network_override.applies_to is None:
+                raise ValueError(
+                    "Requests via a proxy must set 'applies_to' on any "
+                    "network override, to indicate if the override targets "
+                    "the proxy address or the origin."
+                )
+            if network_override.applies_to == "origin":
+                raise ValueError(
+                    "A network override targeting the origin cannot be used "
+                    "with a forwarding proxy, since the proxy establishes "
+                    "the connection to the origin."
+                )
         self._connection = AsyncHTTPConnection(
             origin=proxy_origin,
             keepalive_expiry=keepalive_expiry,
+            network_override=network_override,
             network_backend=network_backend,
             socket_options=socket_options,
             ssl_context=proxy_ssl_context,
@@ -187,6 +215,7 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
         self._proxy_origin = proxy_origin
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
         self._remote_origin = remote_origin
+        self._network_override = network_override
 
     async def handle_async_request(self, request: Request) -> Response:
         headers = merge_headers(self._proxy_headers, request.headers)
@@ -205,8 +234,14 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
         )
         return await self._connection.handle_async_request(proxy_request)
 
-    def can_handle_request(self, origin: Origin) -> bool:
-        return origin == self._remote_origin
+    def can_handle_request(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> bool:
+        return origin == self._remote_origin and network_override == (
+            self._network_override
+        )
 
     async def aclose(self) -> None:
         await self._connection.aclose()
@@ -241,18 +276,41 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         keepalive_expiry: float | None = None,
         http1: bool = True,
         http2: bool = False,
+        network_override: NetworkOverride | None = None,
         network_backend: AsyncNetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
     ) -> None:
+        if network_override is not None:
+            if network_override.applies_to is None:
+                raise ValueError(
+                    "Requests via a proxy must set 'applies_to' on any "
+                    "network override, to indicate if the override targets "
+                    "the proxy address or the tunnel target."
+                )
+            if network_override.applies_to == "origin" and (
+                network_override.uds is not None
+            ):
+                raise ValueError(
+                    "A Unix domain socket network override cannot be applied "
+                    "to a proxy tunnel target."
+                )
+        proxy_override = (
+            network_override
+            if network_override is not None
+            and network_override.applies_to == "proxy"
+            else None
+        )
         self._connection: AsyncConnectionInterface = AsyncHTTPConnection(
             origin=proxy_origin,
             keepalive_expiry=keepalive_expiry,
+            network_override=proxy_override,
             network_backend=network_backend,
             socket_options=socket_options,
             ssl_context=proxy_ssl_context,
         )
         self._proxy_origin = proxy_origin
         self._remote_origin = remote_origin
+        self._network_override = network_override
         self._ssl_context = ssl_context
         self._proxy_ssl_context = proxy_ssl_context
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
@@ -268,7 +326,21 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
 
         async with self._connect_lock:
             if not self._connected:
-                target = b"%b:%d" % (self._remote_origin.host, self._remote_origin.port)
+                # A network override with 'applies_to="origin"' retargets the
+                # tunnel. The HTTP origin is unaffected, so TLS verification
+                # and the `Host` header still use the request URL.
+                override = self._network_override
+                if override is not None and override.applies_to == "origin":
+                    target_host = (
+                        self._remote_origin.host
+                        if override.host is None
+                        else override.host.encode("ascii")
+                    )
+                    target_port = override.port or self._remote_origin.port
+                else:
+                    target_host = self._remote_origin.host
+                    target_port = self._remote_origin.port
+                target = b"%b:%d" % (target_host, target_port)
 
                 connect_url = URL(
                     scheme=self._proxy_origin.scheme,
@@ -279,11 +351,21 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
                 connect_headers = merge_headers(
                     [(b"Host", target), (b"Accept", b"*/*")], self._proxy_headers
                 )
+                if override is not None and override.applies_to == "origin":
+                    # The override has been applied to the tunnel target, and
+                    # must not propagate to the proxy connection itself.
+                    connect_extensions = {
+                        key: value
+                        for key, value in request.extensions.items()
+                        if key != "network_override"
+                    }
+                else:
+                    connect_extensions = request.extensions
                 connect_request = Request(
                     method=b"CONNECT",
                     url=connect_url,
                     headers=connect_headers,
-                    extensions=request.extensions,
+                    extensions=connect_extensions,
                 )
                 connect_response = await self._connection.handle_async_request(
                     connect_request
@@ -342,8 +424,14 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
                 self._connected = True
         return await self._connection.handle_async_request(request)
 
-    def can_handle_request(self, origin: Origin) -> bool:
-        return origin == self._remote_origin
+    def can_handle_request(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> bool:
+        return origin == self._remote_origin and network_override == (
+            self._network_override
+        )
 
     async def aclose(self) -> None:
         await self._connection.aclose()

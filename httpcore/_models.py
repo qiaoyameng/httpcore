@@ -179,6 +179,106 @@ class Origin:
         return f"{scheme}://{host}:{port}"
 
 
+class NetworkOverride:
+    """
+    A per-request override of the network destination used when establishing
+    a connection.
+
+    The override only affects which address the underlying connection is
+    opened to. The HTTP origin is left unchanged, meaning the `Host` header,
+    the SNI hostname, and TLS certificate verification all continue to use
+    the request URL.
+
+    A typical use case is gray-release or canary probing, where a request
+    for `"https://example.com/"` needs to be directed at a specific server
+    IP, without the caller having to rewrite the URL and then manually
+    restore the `Host` header, SNI hostname, and TLS verification:
+
+    ```python
+    override = httpcore.NetworkOverride(host="10.0.0.1", port=8443)
+    request = httpcore.Request(
+        "GET",
+        "https://example.com/",
+        extensions={"network_override": override},
+    )
+    ```
+
+    Overrides are part of the connection pool identity: requests carrying
+    different override values are never assigned to the same reusable
+    connection.
+    """
+
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        uds: str | None = None,
+        applies_to: str | None = None,
+    ) -> None:
+        """
+        Parameters:
+            host: The host to connect to, instead of the request URL host.
+                May be a hostname, an IPv4 literal, or an IPv6 literal such
+                as `"::1"`.
+            port: The port to connect to, instead of the request URL port.
+            uds: A Unix domain socket path to connect to, instead of using
+                TCP. Cannot be combined with `host` or `port`.
+            applies_to: Either `"origin"` or `"proxy"`, indicating which
+                network destination the override applies to when requests
+                are sent via a proxy. Must be set explicitly for proxied
+                requests, since overriding the proxy address and overriding
+                the tunnel target are different operations.
+        """
+        if applies_to not in (None, "origin", "proxy"):
+            raise ValueError(
+                "NetworkOverride 'applies_to' must be 'origin' or 'proxy'."
+            )
+        if host is not None and uds is not None:
+            raise ValueError(
+                "NetworkOverride cannot combine a TCP 'host' with a Unix "
+                "domain socket 'uds'."
+            )
+        if port is not None and uds is not None:
+            raise ValueError(
+                "NetworkOverride cannot combine a TCP 'port' with a Unix "
+                "domain socket 'uds'."
+            )
+        if host is None and port is None and uds is None:
+            raise ValueError(
+                "NetworkOverride requires at least one of 'host', 'port' "
+                "or 'uds'."
+            )
+        if host is not None and not host:
+            raise ValueError("NetworkOverride 'host' must be non-empty.")
+        if uds is not None and not uds:
+            raise ValueError("NetworkOverride 'uds' must be non-empty.")
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError(
+                "NetworkOverride 'port' must be in the range 1-65535."
+            )
+
+        self.host = host
+        self.port = port
+        self.uds = uds
+        self.applies_to = applies_to
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return (
+            isinstance(other, NetworkOverride)
+            and self.host == other.host
+            and self.port == other.port
+            and self.uds == other.uds
+            and self.applies_to == other.applies_to
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(host={self.host!r}, "
+            f"port={self.port!r}, uds={self.uds!r}, "
+            f"applies_to={self.applies_to!r})"
+        )
+
+
 class URL:
     """
     Represents the URL against which an HTTP request may be made.
@@ -339,7 +439,8 @@ class Request:
             headers: The HTTP request headers.
             content: The content of the request body.
             extensions: A dictionary of optional extra information included on
-                the request. Possible keys include `"timeout"`, and `"trace"`.
+                the request. Possible keys include `"timeout"`, `"trace"`,
+                and `"network_override"`.
         """
         self.method: bytes = enforce_bytes(method, name="method")
         self.url: URL = enforce_url(url, name="url")

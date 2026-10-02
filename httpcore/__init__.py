@@ -34,7 +34,7 @@ from ._exceptions import (
     WriteError,
     WriteTimeout,
 )
-from ._models import URL, Origin, Proxy, Request, Response
+from ._models import URL, NetworkOverride, Origin, Proxy, Request, Response
 from ._ssl import default_ssl_context
 from ._sync import (
     ConnectionInterface,
@@ -80,6 +80,7 @@ __all__ = [
     "Request",
     "Response",
     "Proxy",
+    "NetworkOverride",
     # async
     "AsyncHTTPConnection",
     "AsyncConnectionPool",

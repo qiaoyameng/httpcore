@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Add `httpcore.NetworkOverride` and a `"network_override"` request extension, allowing the network destination of a request to be overridden per-request while leaving the HTTP origin (`Host` header, SNI hostname, TLS verification) unchanged.
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
 
 ## Version 1.0.9 (April 24th, 2025)

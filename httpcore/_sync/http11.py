@@ -17,7 +17,7 @@ from .._exceptions import (
     WriteError,
     map_exceptions,
 )
-from .._models import Origin, Request, Response
+from .._models import NetworkOverride, Origin, Request, Response
 from .._synchronization import Lock, ShieldCancellation
 from .._trace import Trace
 from .interfaces import ConnectionInterface
@@ -261,7 +261,11 @@ class HTTP11Connection(ConnectionInterface):
     # the connection, allowing for a connection pooling implementation to
     # determine when to reuse and when to close the connection...
 
-    def can_handle_request(self, origin: Origin) -> bool:
+    def can_handle_request(
+        self,
+        origin: Origin,
+        network_override: NetworkOverride | None = None,
+    ) -> bool:
         return origin == self._origin
 
     def is_available(self) -> bool:
