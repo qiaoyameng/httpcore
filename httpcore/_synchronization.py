@@ -180,6 +180,26 @@ class AsyncSemaphore:
         elif self._backend == "asyncio":
             await self._anyio_semaphore.acquire()
 
+    async def acquire_with_timeout(self, timeout: float) -> bool:
+        """
+        Attempt to acquire the semaphore, waiting at most `timeout` seconds.
+
+        Returns `True` if the semaphore was acquired, or `False` if the
+        timeout elapsed. Cancellations propagate as normal.
+        """
+        if not self._backend:
+            self.setup()
+
+        if self._backend == "trio":
+            with trio.move_on_after(timeout) as cancel_scope:
+                await self._trio_semaphore.acquire()
+            return not cancel_scope.cancel_called
+        elif self._backend == "asyncio":
+            with anyio.move_on_after(timeout) as cancel_scope:
+                await self._anyio_semaphore.acquire()
+            return not cancel_scope.cancel_called
+        raise RuntimeError("Semaphore has no backend.")  # pragma: nocover
+
     async def release(self) -> None:
         if self._backend == "trio":
             self._trio_semaphore.release()
@@ -300,6 +320,9 @@ class Semaphore:
 
     def release(self) -> None:
         self._semaphore.release()
+
+    def acquire_with_timeout(self, timeout: float) -> bool:
+        return self._semaphore.acquire(timeout=timeout)
 
 
 class ShieldCancellation:

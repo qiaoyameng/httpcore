@@ -84,6 +84,51 @@ def test_request_with_target_extension():
     assert request.url.target == b"/unescaped|path"
 
 
+def test_request_retry_on_goaway_extension():
+    # Replay permission is opt-in and is never inferred from the method.
+    get = httpcore.Request("GET", "https://www.example.com/")
+    post = httpcore.Request("POST", "https://www.example.com/")
+    opted = httpcore.Request(
+        "POST",
+        "https://www.example.com/",
+        extensions={"retry_on_goaway": True},
+    )
+    assert not httpcore._models.request_allows_retry(get)
+    assert not httpcore._models.request_allows_retry(post)
+    assert httpcore._models.request_allows_retry(opted)
+
+
+def test_request_stream_replayability():
+    from httpcore._models import stream_is_replayable
+
+    # Byte content is replayable even after being iterated.
+    bytes_request = httpcore.Request(
+        "POST", "https://www.example.com/", content=b"abc"
+    )
+    assert stream_is_replayable(bytes_request.stream)
+    list(bytes_request.stream)
+    assert stream_is_replayable(bytes_request.stream)
+
+    # A one-shot generator is not replayable.
+    def oneshot():
+        yield b"abc"
+
+    gen_request = httpcore.Request(
+        "POST", "https://www.example.com/", content=oneshot()
+    )
+    assert not stream_is_replayable(gen_request.stream)
+
+    # Explicit replayable streams opt in via the base class.
+    class Replay(httpcore.ReplayableByteStream):
+        def __iter__(self):
+            yield b"abc"
+
+        async def __aiter__(self):
+            yield b"abc"
+
+    assert stream_is_replayable(Replay())
+
+
 def test_request_with_invalid_method():
     with pytest.raises(TypeError) as exc_info:
         httpcore.Request(123, "https://www.example.com/")  # type: ignore

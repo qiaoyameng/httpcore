@@ -208,7 +208,8 @@ async def test_connection_pool_with_http2():
 async def test_connection_pool_with_http2_goaway():
     """
     Test a connection pool with HTTP/2 requests, that cleanly disconnects
-    with a GoAway frame after the first request.
+    with a GoAway frame after the first request. The second request opts
+    into replay and is transparently retargeted onto a new connection.
     """
     network_backend = httpcore.AsyncMockBackend(
         buffer=[
@@ -249,7 +250,11 @@ async def test_connection_pool_with_http2_goaway():
 
         # Sending a second request to the same origin will require a new connection.
         # The original connection has now been closed.
-        response = await pool.request("GET", "https://example.com/")
+        response = await pool.request(
+            "GET",
+            "https://example.com/",
+            extensions={"retry_on_goaway": True},
+        )
         assert response.status == 200
         assert response.content == b"Hello, world!"
 

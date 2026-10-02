@@ -15,15 +15,28 @@ import h2.settings
 from .._backends.base import NetworkStream
 from .._exceptions import (
     ConnectionNotAvailable,
+    GoAwayError,
+    GoAwayRetarget,
     LocalProtocolError,
     RemoteProtocolError,
 )
-from .._models import Origin, Request, Response
+from .._models import (
+    Origin,
+    Request,
+    Response,
+    request_allows_retry,
+    stream_is_replayable,
+)
 from .._synchronization import Lock, Semaphore, ShieldCancellation
 from .._trace import Trace
 from .interfaces import ConnectionInterface
 
 logger = logging.getLogger("httpcore.http2")
+
+# When waiting for an outgoing stream slot (due to the server's
+# MAX_CONCURRENT_STREAMS limit), periodically wake up so that a GOAWAY
+# received by another task can interrupt the wait on a bounded timescale.
+STREAM_SLOT_POLL_INTERVAL = 0.1
 
 
 def has_body_headers(request: Request) -> bool:
@@ -78,6 +91,21 @@ class HTTP2Connection(ConnectionInterface):
         # Connection terminated events are stored as state since
         # we need to handle them for all streams.
         self._connection_terminated: h2.events.ConnectionTerminated | None = None
+        # The most conservative (smallest) last stream identifier across
+        # any GOAWAY frames we've received. A second GOAWAY is permitted to
+        # lower this value.
+        self._goaway_last_stream_id: int | None = None
+
+        # Per-stream bookkeeping used to decide whether a request can be
+        # safely retargeted when a GOAWAY is received:
+        #
+        # * `headers_sent`: the request headers (at minimum) were written.
+        # * `body_consumed`: we finished iterating the request body stream.
+        self._stream_headers_sent: set[int] = set()
+        self._stream_body_consumed: set[int] = set()
+        # Mapping of stream id -> request, retained so GOAWAY handling can
+        # inspect replayability while cleaning up a failed request.
+        self._stream_requests: dict[int, Request] = {}
 
         self._read_exception: Exception | None = None
         self._write_exception: Exception | None = None
@@ -94,7 +122,11 @@ class HTTP2Connection(ConnectionInterface):
             )
 
         with self._state_lock:
-            if self._state in (HTTPConnectionState.ACTIVE, HTTPConnectionState.IDLE):
+            if (
+                self._state
+                in (HTTPConnectionState.ACTIVE, HTTPConnectionState.IDLE)
+                and self._connection_terminated is None
+            ):
                 self._request_count += 1
                 self._expire_at = None
                 self._state = HTTPConnectionState.ACTIVE
@@ -128,13 +160,15 @@ class HTTP2Connection(ConnectionInterface):
                 for _ in range(local_settings_max_streams - self._max_streams):
                     self._max_streams_semaphore.acquire()
 
-        self._max_streams_semaphore.acquire()
+        self._acquire_stream_slot()
 
         try:
             stream_id = self._h2_state.get_next_available_stream_id()
             self._events[stream_id] = []
+            self._stream_requests[stream_id] = request
         except h2.exceptions.NoAvailableStreamIDError:  # pragma: nocover
             self._used_all_stream_ids = True
+            self._max_streams_semaphore.release()
             self._request_count -= 1
             raise ConnectionNotAvailable()
 
@@ -142,8 +176,10 @@ class HTTP2Connection(ConnectionInterface):
             kwargs = {"request": request, "stream_id": stream_id}
             with Trace("send_request_headers", logger, request, kwargs):
                 self._send_request_headers(request=request, stream_id=stream_id)
+            self._stream_headers_sent.add(stream_id)
             with Trace("send_request_body", logger, request, kwargs):
                 self._send_request_body(request=request, stream_id=stream_id)
+            self._stream_body_consumed.add(stream_id)
             with Trace(
                 "receive_response_headers", logger, request, kwargs
             ) as trace:
@@ -163,10 +199,24 @@ class HTTP2Connection(ConnectionInterface):
                 },
             )
         except BaseException as exc:  # noqa: PIE786
+            goaway_rejected = self._stream_rejected_by_goaway(stream_id)
+            goaway_error: Exception | None = None
+            if goaway_rejected:
+                # Classify before `_response_closed` drops the per-stream
+                # bookkeeping (headers sent / body consumed) that the
+                # decision depends on.
+                try:
+                    self._raise_goaway_error(request=request, stream_id=stream_id)
+                except Exception as classified:
+                    goaway_error = classified
             with ShieldCancellation():
                 kwargs = {"stream_id": stream_id}
                 with Trace("response_closed", logger, request, kwargs):
                     self._response_closed(stream_id=stream_id)
+
+            if goaway_rejected:
+                assert goaway_error is not None
+                raise goaway_error
 
             if isinstance(exc, h2.exceptions.ProtocolError):
                 # One case where h2 can raise a protocol error is when a
@@ -178,13 +228,135 @@ class HTTP2Connection(ConnectionInterface):
                 #
                 # In this case we'll have stored the event, and should raise
                 # it as a RemoteProtocolError.
-                if self._connection_terminated:  # pragma: nocover
-                    raise RemoteProtocolError(self._connection_terminated)
+                if self._connection_terminated and not goaway_rejected:
+                    self._raise_goaway_error(request=request, stream_id=stream_id)
                 # If h2 raises a protocol error in some other state then we
                 # must somehow have made a protocol violation.
                 raise LocalProtocolError(exc)  # pragma: nocover
 
             raise exc
+
+    def _acquire_stream_slot(self) -> None:
+        """
+        Acquire one of the connection's outgoing stream slots.
+
+        Waits on the MAX_CONCURRENT_STREAMS semaphore, but periodically
+        re-checks for a GOAWAY so that a queued request has a bounded path
+        out of the wait - either retargeted onto a new connection or raised
+        as a terminal error - rather than blocking forever on a connection
+        that is shutting down.
+        """
+        while True:
+            if self._connection_terminated is not None:
+                self._request_count -= 1
+                self._raise_goaway_error(request=request, stream_id=None)
+            acquired = self._max_streams_semaphore.acquire_with_timeout(
+                STREAM_SLOT_POLL_INTERVAL
+            )
+            if acquired:
+                if self._connection_terminated is not None:
+                    # A GOAWAY arrived during the wait. Release the slot we
+                    # just took and bail out without ever using a stream id.
+                    self._max_streams_semaphore.release()
+                    self._request_count -= 1
+                    self._raise_goaway_error(request=request, stream_id=None)
+                return
+
+    def _stream_rejected_by_goaway(self, stream_id: int) -> bool:
+        """
+        Return `True` if a GOAWAY indicates the server never processed the
+        given stream, i.e. its identifier was greater than the most
+        conservative `last_stream_id`.
+        """
+        if self._connection_terminated is None:
+            return False
+        last_stream_id = self._goaway_last_stream_id
+        return last_stream_id is not None and stream_id > last_stream_id
+
+    def _raise_goaway_error(
+        self, request: Request, stream_id: int | None
+    ) -> typing.NoReturn:
+        """
+        Raise the appropriate exception for a stream that was rejected by
+        a GOAWAY frame.
+
+        Requests that the caller explicitly opted in to replay, and whose
+        body can actually be regenerated, surface as `GoAwayRetarget` (a
+        `ConnectionNotAvailable` subclass), which allows the connection
+        pool to transparently retry them on a fresh connection.
+
+        Everything else raises a diagnosable `GoAwayError`. We never infer
+        replay safety from the request method.
+        """
+        event = self._connection_terminated
+        assert event is not None
+
+        last_stream_id = self._goaway_last_stream_id
+        error_code = (
+            int(event.error_code)
+            if event.error_code is not None
+            else None
+        )
+
+        headers_sent = (
+            stream_id is not None and stream_id in self._stream_headers_sent
+        )
+        body_consumed = (
+            stream_id is not None and stream_id in self._stream_body_consumed
+        )
+
+        # A stream that the server may already have started processing can
+        # never be safely retargeted.
+        in_range = (
+            stream_id is not None
+            and last_stream_id is not None
+            and stream_id <= last_stream_id
+        )
+
+        retryable = False
+        reason = "request may have been processed by the server"
+        if in_range:
+            reason = (
+                f"stream {stream_id} is within the GOAWAY range "
+                f"(last_stream_id={last_stream_id})"
+            )
+        elif not request_allows_retry(request):
+            reason = (
+                "request does not allow replay "
+                "(set the 'retry_on_goaway' extension to opt in)"
+            )
+        elif headers_sent and not stream_is_replayable(request.stream):
+            # The request headers (and possibly body) reached the wire, so
+            # we require a genuinely replayable body. A one-shot iterator
+            # cannot produce its bytes a second time - whether or not it
+            # has already been fully iterated.
+            reason = (
+                "request body is not replayable"
+                + (" and has already been consumed" if body_consumed else "")
+            )
+        else:
+            # Either nothing was sent yet (queued / headers not flushed),
+            # or the body can be regenerated.
+            retryable = True
+
+        if retryable:
+            raise GoAwayRetarget(
+                f"Stream {stream_id} was rejected by an HTTP/2 GOAWAY "
+                f"(last_stream_id={last_stream_id}); "
+                "retargeting the request onto a new connection."
+            )
+
+        message = (
+            f"HTTP/2 GOAWAY rejected stream {stream_id} "
+            f"(last_stream_id={last_stream_id}, error_code={error_code}): "
+            f"{reason}."
+        )
+        raise GoAwayError(
+            message,
+            last_stream_id=last_stream_id,
+            stream_id=stream_id,
+            error_code=error_code,
+        )
 
     def _send_connection_init(self, request: Request) -> None:
         """
@@ -347,20 +519,20 @@ class HTTP2Connection(ConnectionInterface):
         for a given stream ID.
         """
         with self._read_lock:
-            if self._connection_terminated is not None:
-                last_stream_id = self._connection_terminated.last_stream_id
-                if stream_id and last_stream_id and stream_id > last_stream_id:
-                    self._request_count -= 1
-                    raise ConnectionNotAvailable()
-                raise RemoteProtocolError(self._connection_terminated)
+            # If we already hold buffered events for this stream, we must
+            # not perform a blocking read. Otherwise keep reading so that
+            # in-flight streams within the GOAWAY range can drain their
+            # final response frames from the server.
+            should_read = stream_id is None or not self._events.get(stream_id)
 
-            # This conditional is a bit icky. We don't want to block reading if we've
-            # actually got an event to return for a given stream. We need to do that
-            # check *within* the atomic read lock. Though it also need to be optional,
-            # because when we call it from `_wait_for_outgoing_flow` we *do* want to
-            # block until we've available flow control, event when we have events
-            # pending for the stream ID we're attempting to send on.
-            if stream_id is None or not self._events.get(stream_id):
+            if (
+                should_read
+                and stream_id is not None
+                and self._stream_rejected_by_goaway(stream_id)
+            ):
+                self._raise_goaway_error(request=request, stream_id=stream_id)
+
+            if should_read:
                 events = self._read_incoming_data(request)
                 for event in events:
                     if isinstance(event, h2.events.RemoteSettingsChanged):
@@ -383,9 +555,41 @@ class HTTP2Connection(ConnectionInterface):
                             self._events[event.stream_id].append(event)
 
                     elif isinstance(event, h2.events.ConnectionTerminated):
-                        self._connection_terminated = event
+                        self._record_goaway(event)
+
+            if self._connection_terminated is not None and not self._events.get(
+                stream_id
+            ) and (
+                stream_id is None
+                or self._stream_rejected_by_goaway(stream_id)
+                or self._read_exception is not None
+            ):
+                # Either the stream was definitely never processed (id
+                # beyond last_stream_id) and may be retargeted, or the
+                # connection is terminating and no response is coming.
+                # In-range streams keep waiting for their final frames.
+                self._raise_goaway_error(request=request, stream_id=stream_id)
 
         self._write_outgoing_data(request)
+
+    def _record_goaway(self, event: h2.events.ConnectionTerminated) -> None:
+        """
+        Record an incoming GOAWAY frame.
+
+        Servers are permitted to send more than one GOAWAY while shutting
+        down, and a subsequent frame may advertise a smaller
+        `last_stream_id`. We always retain the most conservative value,
+        since that is the stream up to which the server is prepared to
+        guarantee processing.
+        """
+        incoming = event.last_stream_id
+        if self._goaway_last_stream_id is None:
+            self._goaway_last_stream_id = incoming
+        elif incoming is not None:
+            self._goaway_last_stream_id = min(
+                self._goaway_last_stream_id, incoming
+            )
+        self._connection_terminated = event
 
     def _receive_remote_settings_change(
         self, event: h2.events.RemoteSettingsChanged
@@ -408,7 +612,10 @@ class HTTP2Connection(ConnectionInterface):
 
     def _response_closed(self, stream_id: int) -> None:
         self._max_streams_semaphore.release()
-        del self._events[stream_id]
+        self._events.pop(stream_id, None)
+        self._stream_requests.pop(stream_id, None)
+        self._stream_headers_sent.discard(stream_id)
+        self._stream_body_consumed.discard(stream_id)
         with self._state_lock:
             if self._connection_terminated and not self._events:
                 self.close()
@@ -497,7 +704,7 @@ class HTTP2Connection(ConnectionInterface):
         max_frame_size: int = self._h2_state.max_outbound_frame_size
         flow = min(local_flow, max_frame_size)
         while flow == 0:
-            self._receive_events(request)
+            self._receive_events(request, stream_id)
             local_flow = self._h2_state.local_flow_control_window(stream_id)
             max_frame_size = self._h2_state.max_outbound_frame_size
             flow = min(local_flow, max_frame_size)

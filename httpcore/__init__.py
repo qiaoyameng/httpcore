@@ -21,6 +21,7 @@ from ._exceptions import (
     ConnectError,
     ConnectionNotAvailable,
     ConnectTimeout,
+    GoAwayError,
     LocalProtocolError,
     NetworkError,
     PoolTimeout,
@@ -34,7 +35,14 @@ from ._exceptions import (
     WriteError,
     WriteTimeout,
 )
-from ._models import URL, Origin, Proxy, Request, Response
+from ._models import (
+    URL,
+    Origin,
+    Proxy,
+    ReplayableByteStream,
+    Request,
+    Response,
+)
 from ._ssl import default_ssl_context
 from ._sync import (
     ConnectionInterface,
@@ -78,6 +86,7 @@ __all__ = [
     "Origin",
     "URL",
     "Request",
+    "ReplayableByteStream",
     "Response",
     "Proxy",
     # async
@@ -127,6 +136,7 @@ __all__ = [
     "WriteTimeout",
     "NetworkError",
     "ConnectError",
+    "GoAwayError",
     "ReadError",
     "WriteError",
 ]

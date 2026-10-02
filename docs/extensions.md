@@ -86,6 +86,38 @@ r = httpcore.request(
 )
 ```
 
+### `"retry_on_goaway"`
+
+A boolean opt-in that allows a request the server definitely never processed to
+be transparently retargeted onto a fresh HTTP/2 connection.
+
+When an HTTP/2 server shuts down it sends a GOAWAY frame carrying a
+`last_stream_id`. Requests on streams with a greater stream id were never seen
+by the server and can safely be resent. Requests on streams at or below that id
+may already have been processed and are always left to complete (or fail), never
+replayed.
+
+httpcore only retargets a request when two conditions both hold:
+
+* The caller explicitly opts in with `"retry_on_goaway": True`. Replay is never
+  inferred from the request method, since a non-GET method is not necessarily
+  idempotent at the application level.
+* The request body is replayable - plain byte content, or a stream derived from
+  `httpcore.ReplayableByteStream`. One-shot iterators/generators cannot be
+  resent.
+
+If a request cannot be retargeted (no opt-in, non-replayable body, or every new
+connection also rejects it), a `httpcore.GoAwayError` is raised.
+
+```python
+r = httpcore.request(
+    "POST",
+    "https://www.example.com/submit",
+    content=b"replayable payload",
+    extensions={"retry_on_goaway": True}
+)
+```
+
 ### `"trace"`
 
 The trace extension allows a callback handler to be installed to monitor the internal

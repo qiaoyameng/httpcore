@@ -76,7 +76,10 @@ async def test_http2_connection_closed():
     ) as conn:
         await conn.request("GET", "https://example.com/")
 
-        with pytest.raises(httpcore.ConnectionNotAvailable):
+        # The GOAWAY advertises last_stream_id=1, so stream 3 was never
+        # processed. Without explicit replay permission this is a terminal,
+        # diagnosable error rather than a retry.
+        with pytest.raises(httpcore.GoAwayError):
             await conn.request("GET", "https://example.com/")
 
         assert not conn.is_available()

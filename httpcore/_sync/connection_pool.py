@@ -7,7 +7,12 @@ import typing
 
 from .._backends.sync import SyncBackend
 from .._backends.base import SOCKET_OPTION, NetworkBackend
-from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
+from .._exceptions import (
+    ConnectionNotAvailable,
+    GoAwayError,
+    GoAwayRetarget,
+    UnsupportedProtocol,
+)
 from .._models import Origin, Proxy, Request, Response
 from .._synchronization import Event, ShieldCancellation, ThreadLock
 from .connection import HTTPConnection
@@ -44,6 +49,12 @@ class ConnectionPool(RequestInterface):
     """
     A connection pool for making HTTP requests.
     """
+
+    # Maximum number of times a single request may be retargeted onto a new
+    # connection because the previous one rejected it with an HTTP/2 GOAWAY.
+    # This bounds the loop when a server keeps sending GOAWAY on fresh
+    # connections.
+    MAX_GOAWAY_RETRIES = 3
 
     def __init__(
         self,
@@ -221,6 +232,7 @@ class ConnectionPool(RequestInterface):
             self._requests.append(pool_request)
 
         try:
+            goaway_retries = 0
             while True:
                 with self._optional_thread_lock:
                     # Assign incoming requests to available connections,
@@ -236,6 +248,15 @@ class ConnectionPool(RequestInterface):
                     response = connection.handle_request(
                         pool_request.request
                     )
+                except GoAwayRetarget:
+                    if goaway_retries >= self.MAX_GOAWAY_RETRIES:
+                        raise GoAwayError(
+                            "Exhausted retries after the server rejected the "
+                            "request with HTTP/2 GOAWAY on "
+                            f"{goaway_retries + 1} consecutive connection(s)."
+                        )
+                    goaway_retries += 1
+                    pool_request.clear_connection()
                 except ConnectionNotAvailable:
                     # In some cases a connection may initially be available to
                     # handle a request, but then become unavailable.

@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Retarget HTTP/2 requests that a server's GOAWAY proves were never
+  processed onto a fresh connection. Requests are only retargeted when the
+  caller opts in with the `"retry_on_goaway": True` request extension and
+  the body is replayable (byte content or a `ReplayableByteStream`);
+  replay safety is never inferred from the request method. Streams within
+  the GOAWAY range continue to completion, a shrinking `last_stream_id` is
+  honoured, and repeated GOAWAYs, waiting requests, and cancellations have
+  bounded termination with a diagnosable `GoAwayError`.
 
 ## Version 1.0.9 (April 24th, 2025)
 

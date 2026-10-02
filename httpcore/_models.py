@@ -158,6 +158,49 @@ class ByteStream:
         return f"<{self.__class__.__name__} [{len(self._content)} bytes]>"
 
 
+class ReplayableByteStream:
+    """
+    Base class for request body streams that are able to regenerate their
+    content.
+
+    If an HTTP/2 server sends a GOAWAY frame before starting to process a
+    request, httpcore may transparently retry that request on a fresh
+    connection. In order to do so the request body must be re-readable.
+    Plain byte content and subclasses of `ReplayableByteStream` are treated
+    as replayable; one-shot iterators/generators are not.
+
+    Callers must also explicitly opt in to retargeting on the request, using
+    the `"retry_on_goaway": True` request extension.
+    """
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        raise NotImplementedError()  # pragma: nocover
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        raise NotImplementedError()  # pragma: nocover
+
+
+def request_allows_retry(request: "Request") -> bool:
+    """
+    Return `True` if the caller explicitly allows this request to be
+    retargeted onto a new connection after an HTTP/2 GOAWAY.
+
+    Retargeting is never inferred from the request method, since non-GET
+    methods are not necessarily idempotent at the application level.
+    """
+    return bool(request.extensions.get("retry_on_goaway", False))
+
+
+def stream_is_replayable(
+    stream: typing.Iterable[bytes] | typing.AsyncIterable[bytes],
+) -> bool:
+    """
+    Return `True` if a request body stream can be iterated over again,
+    and therefore sent a second time on a new connection.
+    """
+    return isinstance(stream, (ByteStream, ReplayableByteStream))
+
+
 class Origin:
     def __init__(self, scheme: bytes, host: bytes, port: int) -> None:
         self.scheme = scheme
