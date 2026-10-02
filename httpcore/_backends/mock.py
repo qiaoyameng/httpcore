@@ -20,6 +20,9 @@ class MockSSLObject:
     def selected_alpn_protocol(self) -> str:
         return "h2" if self._http2 else "http/1.1"
 
+    def getpeercert(self, binary_form: bool = False) -> bytes | None:
+        return None
+
 
 class MockStream(NetworkStream):
     def __init__(self, buffer: list[bytes], http2: bool = False) -> None:

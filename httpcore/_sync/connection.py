@@ -8,8 +8,16 @@ import typing
 
 from .._backends.sync import SyncBackend
 from .._backends.base import SOCKET_OPTION, NetworkBackend, NetworkStream
-from .._exceptions import ConnectError, ConnectTimeout
+from .._exceptions import CertificatePinError, ConnectError, ConnectTimeout
 from .._models import Origin, Request, Response
+from .._pinning import (
+    combine_ssl_pins,
+    connection_accepts_ssl_pins,
+    get_peer_certificate_sha256,
+    get_ssl_pins,
+    require_tls_request,
+    ssl_pins_match,
+)
 from .._ssl import default_ssl_context
 from .._synchronization import Lock
 from .._trace import Trace
@@ -48,6 +56,7 @@ class HTTPConnection(ConnectionInterface):
         uds: str | None = None,
         network_backend: NetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        ssl_pins: frozenset[bytes] | None = None,
     ) -> None:
         self._origin = origin
         self._ssl_context = ssl_context
@@ -65,17 +74,40 @@ class HTTPConnection(ConnectionInterface):
         self._connect_failed: bool = False
         self._request_lock = Lock()
         self._socket_options = socket_options
+        self._ssl_pins = ssl_pins
+        self._ssl_fingerprint: bytes | None = None
 
     def handle_request(self, request: Request) -> Response:
         if not self.can_handle_request(request.url.origin):
             raise RuntimeError(
                 f"Attempted to send request to {request.url.origin} on connection to {self._origin}"
             )
+        require_tls_request(request)
+        request_ssl_pins = get_ssl_pins(request)
 
         try:
             with self._request_lock:
                 if self._connection is None:
                     stream = self._connect(request)
+                    try:
+                        if self._origin.scheme in (b"https", b"wss"):
+                            effective_ssl_pins = combine_ssl_pins(
+                                self._ssl_pins, request_ssl_pins
+                            )
+                            if effective_ssl_pins is not None:
+                                ssl_object = stream.get_extra_info("ssl_object")
+                                self._ssl_fingerprint = (
+                                    get_peer_certificate_sha256(ssl_object)
+                                )
+                                if not ssl_pins_match(
+                                    self._ssl_fingerprint, effective_ssl_pins
+                                ):
+                                    raise CertificatePinError(
+                                        "Peer certificate does not match any configured pin."
+                                    )
+                    except BaseException:
+                        stream.close()
+                        raise
 
                     ssl_object = stream.get_extra_info("ssl_object")
                     http2_negotiated = (
@@ -96,6 +128,12 @@ class HTTPConnection(ConnectionInterface):
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
                         )
+                elif not connection_accepts_ssl_pins(
+                    self._ssl_pins, self._ssl_fingerprint, request_ssl_pins
+                ):
+                    raise CertificatePinError(
+                        "Connection certificate does not match the request pins."
+                    )
         except BaseException as exc:
             self._connect_failed = True
             raise exc
@@ -156,6 +194,8 @@ class HTTPConnection(ConnectionInterface):
                         stream = stream.start_tls(**kwargs)
                         trace.return_value = stream
                 return stream
+            except CertificatePinError:
+                raise
             except (ConnectError, ConnectTimeout):
                 if retries_left <= 0:
                     raise
@@ -164,8 +204,14 @@ class HTTPConnection(ConnectionInterface):
                 with Trace("retry", logger, request, kwargs) as trace:
                     self._network_backend.sleep(delay)
 
-    def can_handle_request(self, origin: Origin) -> bool:
-        return origin == self._origin
+    def can_handle_request(
+        self, origin: Origin, ssl_pins: frozenset[bytes] | None = None
+    ) -> bool:
+        if origin != self._origin:
+            return False
+        return connection_accepts_ssl_pins(
+            self._ssl_pins, self._ssl_fingerprint, ssl_pins
+        )
 
     def close(self) -> None:
         if self._connection is not None:

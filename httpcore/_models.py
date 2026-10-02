@@ -339,7 +339,8 @@ class Request:
             headers: The HTTP request headers.
             content: The content of the request body.
             extensions: A dictionary of optional extra information included on
-                the request. Possible keys include `"timeout"`, and `"trace"`.
+                the request. Possible keys include `"timeout"`, `"trace"`, and
+                `"ssl_pins"`.
         """
         self.method: bytes = enforce_bytes(method, name="method")
         self.url: URL = enforce_url(url, name="url")

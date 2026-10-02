@@ -21,6 +21,7 @@ from ._exceptions import (
     ConnectError,
     ConnectionNotAvailable,
     ConnectTimeout,
+    CertificatePinError,
     LocalProtocolError,
     NetworkError,
     PoolTimeout,
@@ -127,6 +128,7 @@ __all__ = [
     "WriteTimeout",
     "NetworkError",
     "ConnectError",
+    "CertificatePinError",
     "ReadError",
     "WriteError",
 ]

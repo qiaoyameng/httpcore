@@ -166,6 +166,32 @@ response = httpcore.request(
 )
 ```
 
+### `"ssl_pins"`
+
+A set of permitted SHA-256 fingerprints for the server certificate. Each value must
+be the raw 32 byte digest of the complete DER-encoded leaf certificate.
+
+Certificate pinning is an additional check. Standard certificate authority and
+hostname verification is still performed.
+
+```python
+import hashlib
+import httpcore
+
+der = b"..."  # The complete DER-encoded server certificate.
+fingerprint = hashlib.sha256(der).digest()
+response = httpcore.request(
+    "GET",
+    "https://www.example.com",
+    extensions={"ssl_pins": {fingerprint}},
+)
+```
+
+When connecting through an HTTPS proxy with `CONNECT`, the fingerprint is checked
+against the tunnel target certificate rather than the proxy certificate. The
+extension is only valid for TLS requests, and a backend that cannot expose the peer
+certificate in DER form raises an error before the HTTP request is sent.
+
 ### `"target"`
 
 The target that is used as [the HTTP target instead of the URL path](https://datatracker.ietf.org/doc/html/rfc2616#section-5.1.2).

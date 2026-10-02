@@ -32,7 +32,7 @@ def request(
         content: The content of the request body. Either as bytes,
             or as a bytes iterator.
         extensions: A dictionary of optional extra information included on the request.
-            Possible keys include `"timeout"`.
+            Possible keys include `"timeout"` and `"ssl_pins"`.
 
     Returns:
         An instance of `httpcore.Response`.
@@ -78,7 +78,7 @@ def stream(
         content: The content of the request body. Either as bytes,
             or as a bytes iterator.
         extensions: A dictionary of optional extra information included on the request.
-            Possible keys include `"timeout"`.
+            Possible keys include `"timeout"` and `"ssl_pins"`.
 
     Returns:
         An instance of `httpcore.Response`.

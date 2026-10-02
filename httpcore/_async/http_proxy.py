@@ -6,7 +6,7 @@ import ssl
 import typing
 
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
-from .._exceptions import ProxyError
+from .._exceptions import CertificatePinError, ProxyError
 from .._models import (
     URL,
     Origin,
@@ -15,6 +15,12 @@ from .._models import (
     enforce_bytes,
     enforce_headers,
     enforce_url,
+)
+from .._pinning import (
+    combine_ssl_pins, connection_accepts_ssl_pins, get_peer_certificate_sha256,
+    get_ssl_pins,
+    require_tls_request,
+    ssl_pins_match,
 )
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
@@ -49,6 +55,18 @@ def merge_headers(
         if key.lower() not in has_override
     ]
     return default_headers + override_headers
+
+
+def without_ssl_pins(
+    extensions: dict[str, typing.Any] | None,
+) -> dict[str, typing.Any]:
+    if extensions is None:
+        return {}
+    return {
+        key: value
+        for key, value in extensions.items()
+        if key != "ssl_pins"
+    }
 
 
 class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
@@ -189,6 +207,7 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
         self._remote_origin = remote_origin
 
     async def handle_async_request(self, request: Request) -> Response:
+        require_tls_request(request)
         headers = merge_headers(self._proxy_headers, request.headers)
         url = URL(
             scheme=self._proxy_origin.scheme,
@@ -243,6 +262,7 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         http2: bool = False,
         network_backend: AsyncNetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        ssl_pins: frozenset[bytes] | None = None,
     ) -> None:
         self._connection: AsyncConnectionInterface = AsyncHTTPConnection(
             origin=proxy_origin,
@@ -261,89 +281,135 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         self._http2 = http2
         self._connect_lock = AsyncLock()
         self._connected = False
+        self._connect_failed = False
+        self._ssl_pins = ssl_pins
+        self._ssl_fingerprint: bytes | None = None
 
     async def handle_async_request(self, request: Request) -> Response:
+        require_tls_request(request)
+        request_ssl_pins = get_ssl_pins(request)
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("connect", None)
+        connect_response: Response | None = None
 
-        async with self._connect_lock:
-            if not self._connected:
-                target = b"%b:%d" % (self._remote_origin.host, self._remote_origin.port)
-
-                connect_url = URL(
-                    scheme=self._proxy_origin.scheme,
-                    host=self._proxy_origin.host,
-                    port=self._proxy_origin.port,
-                    target=target,
-                )
-                connect_headers = merge_headers(
-                    [(b"Host", target), (b"Accept", b"*/*")], self._proxy_headers
-                )
-                connect_request = Request(
-                    method=b"CONNECT",
-                    url=connect_url,
-                    headers=connect_headers,
-                    extensions=request.extensions,
-                )
-                connect_response = await self._connection.handle_async_request(
-                    connect_request
-                )
-
-                if connect_response.status < 200 or connect_response.status > 299:
-                    reason_bytes = connect_response.extensions.get("reason_phrase", b"")
-                    reason_str = reason_bytes.decode("ascii", errors="ignore")
-                    msg = "%d %s" % (connect_response.status, reason_str)
-                    await self._connection.aclose()
-                    raise ProxyError(msg)
-
-                stream = connect_response.extensions["network_stream"]
-
-                # Upgrade the stream to SSL
-                ssl_context = (
-                    default_ssl_context()
-                    if self._ssl_context is None
-                    else self._ssl_context
-                )
-                alpn_protocols = ["http/1.1", "h2"] if self._http2 else ["http/1.1"]
-                ssl_context.set_alpn_protocols(alpn_protocols)
-
-                kwargs = {
-                    "ssl_context": ssl_context,
-                    "server_hostname": self._remote_origin.host.decode("ascii"),
-                    "timeout": timeout,
-                }
-                async with Trace("start_tls", logger, request, kwargs) as trace:
-                    stream = await stream.start_tls(**kwargs)
-                    trace.return_value = stream
-
-                # Determine if we should be using HTTP/1.1 or HTTP/2
-                ssl_object = stream.get_extra_info("ssl_object")
-                http2_negotiated = (
-                    ssl_object is not None
-                    and ssl_object.selected_alpn_protocol() == "h2"
-                )
-
-                # Create the HTTP/1.1 or HTTP/2 connection
-                if http2_negotiated or (self._http2 and not self._http1):
-                    from .http2 import AsyncHTTP2Connection
-
-                    self._connection = AsyncHTTP2Connection(
-                        origin=self._remote_origin,
-                        stream=stream,
-                        keepalive_expiry=self._keepalive_expiry,
-                    )
-                else:
-                    self._connection = AsyncHTTP11Connection(
-                        origin=self._remote_origin,
-                        stream=stream,
-                        keepalive_expiry=self._keepalive_expiry,
+        try:
+            async with self._connect_lock:
+                if not self._connected:
+                    target = b"%b:%d" % (
+                        self._remote_origin.host,
+                        self._remote_origin.port,
                     )
 
-                self._connected = True
+                    connect_url = URL(
+                        scheme=self._proxy_origin.scheme,
+                        host=self._proxy_origin.host,
+                        port=self._proxy_origin.port,
+                        target=target,
+                    )
+                    connect_headers = merge_headers(
+                        [(b"Host", target), (b"Accept", b"*/*")],
+                        self._proxy_headers,
+                    )
+                    connect_request = Request(
+                        method=b"CONNECT",
+                        url=connect_url,
+                        headers=connect_headers,
+                        extensions=without_ssl_pins(request.extensions),
+                    )
+                    connect_response = await self._connection.handle_async_request(
+                        connect_request
+                    )
+
+                    if (
+                        connect_response.status < 200
+                        or connect_response.status > 299
+                    ):
+                        reason_bytes = connect_response.extensions.get(
+                            "reason_phrase", b""
+                        )
+                        reason_str = reason_bytes.decode("ascii", errors="ignore")
+                        msg = "%d %s" % (connect_response.status, reason_str)
+                        await self._connection.aclose()
+                        raise ProxyError(msg)
+
+                    stream = connect_response.extensions["network_stream"]
+
+                    ssl_context = (
+                        default_ssl_context()
+                        if self._ssl_context is None
+                        else self._ssl_context
+                    )
+                    alpn_protocols = (
+                        ["http/1.1", "h2"] if self._http2 else ["http/1.1"]
+                    )
+                    ssl_context.set_alpn_protocols(alpn_protocols)
+
+                    kwargs = {
+                        "ssl_context": ssl_context,
+                        "server_hostname": self._remote_origin.host.decode("ascii"),
+                        "timeout": timeout,
+                    }
+                    async with Trace("start_tls", logger, request, kwargs) as trace:
+                        stream = await stream.start_tls(**kwargs)
+                        trace.return_value = stream
+
+                    effective_ssl_pins = combine_ssl_pins(
+                        self._ssl_pins, request_ssl_pins
+                    )
+                    if effective_ssl_pins is not None:
+                        self._ssl_fingerprint = get_peer_certificate_sha256(
+                            stream.get_extra_info("ssl_object")
+                        )
+                        if not ssl_pins_match(
+                            self._ssl_fingerprint, effective_ssl_pins
+                        ):
+                            raise CertificatePinError(
+                                "Peer certificate does not match any configured pin."
+                            )
+
+                    ssl_object = stream.get_extra_info("ssl_object")
+                    http2_negotiated = (
+                        ssl_object is not None
+                        and ssl_object.selected_alpn_protocol() == "h2"
+                    )
+
+                    if http2_negotiated or (self._http2 and not self._http1):
+                        from .http2 import AsyncHTTP2Connection
+
+                        self._connection = AsyncHTTP2Connection(
+                            origin=self._remote_origin,
+                            stream=stream,
+                            keepalive_expiry=self._keepalive_expiry,
+                        )
+                    else:
+                        self._connection = AsyncHTTP11Connection(
+                            origin=self._remote_origin,
+                            stream=stream,
+                            keepalive_expiry=self._keepalive_expiry,
+                        )
+
+                    self._connected = True
+        except BaseException:
+            if connect_response is not None:
+                await connect_response.aclose()
+            self._connect_failed = True
+            raise
+        if not connection_accepts_ssl_pins(
+            self._ssl_pins, self._ssl_fingerprint, request_ssl_pins
+        ):
+            raise CertificatePinError(
+                "Connection certificate does not match the request pins."
+            )
         return await self._connection.handle_async_request(request)
 
-    def can_handle_request(self, origin: Origin) -> bool:
-        return origin == self._remote_origin
+    def can_handle_request(
+        self, origin: Origin, ssl_pins: frozenset[bytes] | None = None
+    ) -> bool:
+        if origin != self._remote_origin:
+            return False
+        return connection_accepts_ssl_pins(
+            self._ssl_pins, self._ssl_fingerprint, ssl_pins
+        )
 
     async def aclose(self) -> None:
         await self._connection.aclose()
@@ -361,7 +427,7 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         return self._connection.is_idle()
 
     def is_closed(self) -> bool:
-        return self._connection.is_closed()
+        return self._connect_failed or self._connection.is_closed()
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} [{self.info()}]>"

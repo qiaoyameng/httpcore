@@ -91,7 +91,9 @@ class AsyncConnectionInterface(AsyncRequestInterface):
     def info(self) -> str:
         raise NotImplementedError()  # pragma: nocover
 
-    def can_handle_request(self, origin: Origin) -> bool:
+    def can_handle_request(
+        self, origin: Origin, ssl_pins: frozenset[bytes] | None = None
+    ) -> bool:
         raise NotImplementedError()  # pragma: nocover
 
     def is_available(self) -> bool:

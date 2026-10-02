@@ -9,6 +9,7 @@ from .._backends.sync import SyncBackend
 from .._backends.base import SOCKET_OPTION, NetworkBackend
 from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
 from .._models import Origin, Proxy, Request, Response
+from .._pinning import get_ssl_pins, require_tls_request
 from .._synchronization import Event, ShieldCancellation, ThreadLock
 from .connection import HTTPConnection
 from .interfaces import ConnectionInterface, RequestInterface
@@ -126,6 +127,7 @@ class ConnectionPool(RequestInterface):
         self._optional_thread_lock = ThreadLock()
 
     def create_connection(self, origin: Origin) -> ConnectionInterface:
+        ssl_pins = getattr(self, "_next_ssl_pins", None)
         if self._proxy is not None:
             if self._proxy.url.scheme in (b"socks5", b"socks5h"):
                 from .socks_proxy import Socks5Connection
@@ -135,6 +137,7 @@ class ConnectionPool(RequestInterface):
                     proxy_auth=self._proxy.auth,
                     remote_origin=origin,
                     ssl_context=self._ssl_context,
+                    ssl_pins=ssl_pins,
                     keepalive_expiry=self._keepalive_expiry,
                     http1=self._http1,
                     http2=self._http2,
@@ -159,6 +162,7 @@ class ConnectionPool(RequestInterface):
                 proxy_ssl_context=self._proxy.ssl_context,
                 remote_origin=origin,
                 ssl_context=self._ssl_context,
+                ssl_pins=ssl_pins,
                 keepalive_expiry=self._keepalive_expiry,
                 http1=self._http1,
                 http2=self._http2,
@@ -176,6 +180,7 @@ class ConnectionPool(RequestInterface):
             uds=self._uds,
             network_backend=self._network_backend,
             socket_options=self._socket_options,
+            ssl_pins=ssl_pins,
         )
 
     @property
@@ -211,6 +216,7 @@ class ConnectionPool(RequestInterface):
             raise UnsupportedProtocol(
                 f"Request URL has an unsupported protocol '{scheme}://'."
             )
+        require_tls_request(request)
 
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("pool", None)
@@ -302,10 +308,12 @@ class ConnectionPool(RequestInterface):
         queued_requests = [request for request in self._requests if request.is_queued()]
         for pool_request in queued_requests:
             origin = pool_request.request.url.origin
+            ssl_pins = get_ssl_pins(pool_request.request)
             available_connections = [
                 connection
                 for connection in self._connections
-                if connection.can_handle_request(origin) and connection.is_available()
+                if connection.can_handle_request(origin, ssl_pins=ssl_pins)
+                and connection.is_available()
             ]
             idle_connections = [
                 connection for connection in self._connections if connection.is_idle()
@@ -323,7 +331,11 @@ class ConnectionPool(RequestInterface):
                 pool_request.assign_to_connection(connection)
             elif len(self._connections) < self._max_connections:
                 # log: "creating new connection"
-                connection = self.create_connection(origin)
+                self._next_ssl_pins = ssl_pins
+                try:
+                    connection = self.create_connection(origin)
+                finally:
+                    del self._next_ssl_pins
                 self._connections.append(connection)
                 pool_request.assign_to_connection(connection)
             elif idle_connections:
@@ -332,7 +344,11 @@ class ConnectionPool(RequestInterface):
                 self._connections.remove(connection)
                 closing_connections.append(connection)
                 # log: "creating new connection"
-                connection = self.create_connection(origin)
+                self._next_ssl_pins = ssl_pins
+                try:
+                    connection = self.create_connection(origin)
+                finally:
+                    del self._next_ssl_pins
                 self._connections.append(connection)
                 pool_request.assign_to_connection(connection)
 

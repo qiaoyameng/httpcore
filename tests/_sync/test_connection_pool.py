@@ -1,4 +1,6 @@
+import hashlib
 import logging
+import ssl
 import typing
 
 import hpack
@@ -835,3 +837,254 @@ def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+class CertificateMockSSLObject:
+    def __init__(self, der: bytes, http2: bool = False) -> None:
+        self._der = der
+        self._http2 = http2
+
+    def selected_alpn_protocol(self) -> str:
+        return "h2" if self._http2 else "http/1.1"
+
+    def getpeercert(self, binary_form: bool = False) -> bytes:
+        assert binary_form
+        return self._der
+
+
+class CertificateMockStream(httpcore.NetworkStream):
+    def __init__(
+        self,
+        der: bytes | None,
+        response: list[bytes] | None = None,
+        http2: bool = False,
+        target_der: bytes | None = None,
+    ) -> None:
+        self._der = der
+        self._target_der = target_der
+        self._buffer = list(response or [])
+        self._http2 = http2
+        self._target_tls = False
+        self._tls_upgrades = 0
+        self.close_count = 0
+        self.request_bytes = b""
+        self.target_request_bytes = b""
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return self._buffer.pop(0)
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.request_bytes += buffer
+        if self._target_tls:
+            self.target_request_bytes += buffer
+
+    def close(self) -> None:
+        self.close_count += 1
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        self._tls_upgrades += 1
+        if self._target_der is not None:
+            if self._tls_upgrades == 2:
+                self._der = self._target_der
+                self._target_tls = True
+                self.target_request_bytes = b""
+        return self
+
+    def get_extra_info(self, info: str) -> typing.Any:
+        if info == "ssl_object" and self._der is not None:
+            return CertificateMockSSLObject(self._der, self._http2)
+        return None
+
+
+class CertificateMockBackend(httpcore.NetworkBackend):
+    def __init__(self, streams: list[CertificateMockStream]) -> None:
+        self._streams = streams
+        self.streams = streams
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: typing.Optional[typing.Iterable[httpcore.SOCKET_OPTION]] = None,
+    ) -> CertificateMockStream:
+        return self._streams.pop(0)
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: typing.Optional[typing.Iterable[httpcore.SOCKET_OPTION]] = None,
+    ) -> CertificateMockStream:
+        raise NotImplementedError()
+
+    def sleep(self, seconds: float) -> None:
+        raise NotImplementedError()
+
+
+def http1_response() -> list[bytes]:
+    return [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n",
+        b"ok",
+    ]
+
+
+
+def test_ssl_pins_reject_non_tls_requests_before_connecting():
+    backend = CertificateMockBackend([])
+
+    with httpcore.ConnectionPool(network_backend=backend) as pool:
+        with pytest.raises(httpcore.CertificatePinError):
+            pool.request(
+                "GET",
+                "http://example.com/",
+                extensions={"ssl_pins": {b"x" * 32}},
+            )
+
+    assert not backend.streams
+
+
+
+def test_ssl_pins_require_backend_certificate_information():
+    stream = CertificateMockStream(None, http1_response())
+    backend = CertificateMockBackend([stream])
+
+    with httpcore.ConnectionPool(network_backend=backend) as pool:
+        with pytest.raises(httpcore.CertificatePinError):
+            pool.request(
+                "GET",
+                "https://example.com/",
+                extensions={"ssl_pins": {b"x" * 32}},
+            )
+
+    assert stream.request_bytes == b""
+
+
+
+def test_ssl_pins_are_checked_when_reusing_connections():
+    certificate_a = b"server-certificate-a"
+    certificate_b = b"server-certificate-b"
+    pin_a = hashlib.sha256(certificate_a).digest()
+    pin_b = hashlib.sha256(certificate_b).digest()
+
+    stream_a_first = CertificateMockStream(certificate_a, http1_response() * 2)
+    stream_a_failed = CertificateMockStream(certificate_a)
+    stream_b = CertificateMockStream(certificate_b, http1_response() * 2)
+    backend = CertificateMockBackend([stream_a_first, stream_a_failed, stream_b])
+
+    with httpcore.ConnectionPool(network_backend=backend) as pool:
+        response = pool.request(
+            "GET",
+            "https://example.com/",
+            extensions={"ssl_pins": {pin_a}},
+        )
+        assert response.content == b"ok"
+
+        with pytest.raises(httpcore.CertificatePinError):
+            pool.request(
+                "GET",
+                "https://example.com/",
+                extensions={"ssl_pins": {pin_b}},
+            )
+        assert len(backend.streams) == 1
+
+        response = pool.request(
+            "GET",
+            "https://example.com/",
+            extensions={"ssl_pins": {pin_b}},
+        )
+        assert response.content == b"ok"
+
+        response = pool.request(
+            "GET",
+            "https://example.com/",
+            extensions={"ssl_pins": {pin_b}},
+        )
+        assert response.content == b"ok"
+
+        response = pool.request(
+            "GET",
+            "https://example.com/",
+            extensions={"ssl_pins": {pin_a}},
+        )
+        assert response.content == b"ok"
+
+    assert stream_a_first.request_bytes.count(b"GET / HTTP/1.1") == 2
+    assert stream_a_failed.request_bytes == b""
+    assert stream_b.request_bytes.count(b"GET / HTTP/1.1") == 2
+
+
+
+def test_http2_ssl_pins_do_not_borrow_a_non_matching_active_connection():
+    certificate_a = b"http2-server-certificate-a"
+    certificate_b = b"http2-server-certificate-b"
+    pin_a = hashlib.sha256(certificate_a).digest()
+    pin_b = hashlib.sha256(certificate_b).digest()
+
+    def http2_headers(stream_id: int) -> list[bytes]:
+        return [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=stream_id,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS"],
+            ).serialize(),
+        ]
+
+    stream_a = CertificateMockStream(certificate_a, http2_headers(1), http2=True)
+    stream_b = CertificateMockStream(certificate_b, http2_headers(1), http2=True)
+    backend = CertificateMockBackend([stream_a, stream_b])
+
+    with httpcore.ConnectionPool(
+        network_backend=backend,
+        http2=True,
+    ) as pool:
+        with pool.stream(
+            "GET",
+            "https://example.com/",
+            extensions={"ssl_pins": {pin_a}},
+        ) as response_a:
+            with pool.stream(
+                "GET",
+                "https://example.com/",
+                extensions={"ssl_pins": {pin_b}},
+            ) as response_b:
+                assert len(pool.connections) == 2
+                assert response_a.status == 200
+                assert response_b.status == 200
+
+    assert stream_a.request_bytes != b""
+    assert stream_b.request_bytes != b""
+
+
+
+def test_tunneled_proxy_ssl_pins_check_target_certificate_not_proxy():
+    proxy_certificate = b"proxy-certificate"
+    target_certificate = b"target-certificate"
+    proxy_pin = hashlib.sha256(proxy_certificate).digest()
+    stream = CertificateMockStream(
+        proxy_certificate,
+        [b"HTTP/1.1 200 OK\r\n\r\n"],
+        target_der=target_certificate,
+    )
+    backend = CertificateMockBackend([stream])
+
+    with httpcore.ConnectionPool(
+        proxy=httpcore.Proxy("https://proxy.example.com/"),
+        network_backend=backend,
+    ) as pool:
+        with pytest.raises(httpcore.CertificatePinError):
+            pool.request(
+                "GET",
+                "https://target.example.com/",
+                extensions={"ssl_pins": {proxy_pin}},
+            )
+
+    assert b"CONNECT target.example.com:443" in stream.request_bytes
+    assert stream.target_request_bytes == b""
+    assert stream.close_count == 1

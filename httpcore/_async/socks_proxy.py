@@ -7,8 +7,16 @@ import socksio
 
 from .._backends.auto import AutoBackend
 from .._backends.base import AsyncNetworkBackend, AsyncNetworkStream
-from .._exceptions import ConnectionNotAvailable, ProxyError
+from .._exceptions import CertificatePinError, ConnectionNotAvailable, ProxyError
 from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
+from .._pinning import (
+    combine_ssl_pins,
+    connection_accepts_ssl_pins,
+    get_peer_certificate_sha256,
+    get_ssl_pins,
+    require_tls_request,
+    ssl_pins_match,
+)
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
@@ -197,6 +205,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
         http1: bool = True,
         http2: bool = False,
         network_backend: AsyncNetworkBackend | None = None,
+        ssl_pins: frozenset[bytes] | None = None,
     ) -> None:
         self._proxy_origin = proxy_origin
         self._remote_origin = remote_origin
@@ -212,8 +221,12 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
         self._connect_lock = AsyncLock()
         self._connection: AsyncConnectionInterface | None = None
         self._connect_failed = False
+        self._ssl_pins = ssl_pins
+        self._ssl_fingerprint: bytes | None = None
 
     async def handle_async_request(self, request: Request) -> Response:
+        require_tls_request(request)
+        request_ssl_pins = get_ssl_pins(request)
         timeouts = request.extensions.get("timeout", {})
         sni_hostname = request.extensions.get("sni_hostname", None)
         timeout = timeouts.get("connect", None)
@@ -266,6 +279,21 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
                             stream = await stream.start_tls(**kwargs)
                             trace.return_value = stream
 
+                        effective_ssl_pins = combine_ssl_pins(
+                            self._ssl_pins, request_ssl_pins
+                        )
+                        if effective_ssl_pins is not None:
+                            self._ssl_fingerprint = get_peer_certificate_sha256(
+                                stream.get_extra_info("ssl_object")
+                            )
+                            if not ssl_pins_match(
+                                self._ssl_fingerprint, effective_ssl_pins
+                            ):
+                                await stream.aclose()
+                                raise CertificatePinError(
+                                    "Peer certificate does not match any configured pin."
+                                )
+
                     # Determine if we should be using HTTP/1.1 or HTTP/2
                     ssl_object = stream.get_extra_info("ssl_object")
                     http2_negotiated = (
@@ -296,10 +324,22 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
             elif not self._connection.is_available():  # pragma: nocover
                 raise ConnectionNotAvailable()
 
+        if not connection_accepts_ssl_pins(
+            self._ssl_pins, self._ssl_fingerprint, request_ssl_pins
+        ):
+            raise CertificatePinError(
+                "Connection certificate does not match the request pins."
+            )
         return await self._connection.handle_async_request(request)
 
-    def can_handle_request(self, origin: Origin) -> bool:
-        return origin == self._remote_origin
+    def can_handle_request(
+        self, origin: Origin, ssl_pins: frozenset[bytes] | None = None
+    ) -> bool:
+        if origin != self._remote_origin:
+            return False
+        return connection_accepts_ssl_pins(
+            self._ssl_pins, self._ssl_fingerprint, ssl_pins
+        )
 
     async def aclose(self) -> None:
         if self._connection is not None:
