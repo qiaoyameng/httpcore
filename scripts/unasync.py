@@ -21,6 +21,8 @@ SUBS = [
     ('__aenter__', '__enter__'),
     ('__aexit__', '__exit__'),
     ('__aiter__', '__iter__'),
+    ('__anext__', '__next__'),
+    ('StopAsyncIteration', 'StopIteration'),
     ('@pytest.mark.anyio', ''),
     ('@pytest.mark.trio', ''),
     ('AutoBackend', 'SyncBackend'),

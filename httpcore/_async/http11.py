@@ -13,6 +13,7 @@ from .._backends.base import AsyncNetworkStream
 from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
+    ReadTimeout,
     RemoteProtocolError,
     WriteError,
     map_exceptions,
@@ -57,6 +58,7 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         self._state = HTTPConnectionState.NEW
         self._state_lock = AsyncLock()
         self._request_count = 0
+        self._response_event: h11.Event | type[h11.PAUSED] | None = None
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
             max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
@@ -84,8 +86,23 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
                     "send_request_headers", logger, request, kwargs
                 ) as trace:
                     await self._send_request_headers(**kwargs)
-                async with Trace("send_request_body", logger, request, kwargs) as trace:
-                    await self._send_request_body(**kwargs)
+                should_send_body = True
+                if self._expects_continue(request):
+                    async with Trace(
+                        "receive_100_continue", logger, request, kwargs
+                    ) as trace:
+                        expect_continue_event = await self._receive_expect_continue(
+                            **kwargs
+                        )
+                    should_send_body = expect_continue_event is None
+                    if expect_continue_event is not None:
+                        self._response_event = expect_continue_event
+
+                if should_send_body:
+                    async with Trace(
+                        "send_request_body", logger, request, kwargs
+                    ) as trace:
+                        await self._send_request_body(**kwargs)
             except WriteError:
                 # If we get a write error while we're writing the request,
                 # then we supress this error and move on to attempting to
@@ -154,9 +171,27 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         timeout = timeouts.get("write", None)
 
         assert isinstance(request.stream, typing.AsyncIterable)
-        async for chunk in request.stream:
-            event = h11.Data(data=chunk)
-            await self._send_event(event, timeout=timeout)
+        body = request.stream
+        stream = body.__aiter__()
+        try:
+            while True:
+                try:
+                    chunk = await stream.__anext__()
+                except StopAsyncIteration:
+                    break
+
+                event = h11.Data(data=chunk)
+                await self._send_event(event, timeout=timeout)
+        except BaseException:
+            with AsyncShieldCancellation():
+                close = getattr(stream, "aclose", None)
+                if close is not None:
+                    await close()
+                if body is not stream:
+                    close_body = getattr(body, "aclose", None)
+                    if close_body is not None:
+                        await close_body()
+            raise
 
         await self._send_event(h11.EndOfMessage(), timeout=timeout)
 
@@ -174,7 +209,10 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         timeout = timeouts.get("read", None)
 
         while True:
-            event = await self._receive_event(timeout=timeout)
+            event = self._response_event
+            self._response_event = None
+            if event is None:
+                event = await self._receive_event(timeout=timeout)
             if isinstance(event, h11.Response):
                 break
             if (
@@ -192,6 +230,40 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         trailing_data, _ = self._h11_state.trailing_data
 
         return http_version, event.status_code, event.reason, headers, trailing_data
+
+    def _expects_continue(self, request: Request) -> bool:
+        for name, value in request.headers:
+            if (
+                name.lower() == b"expect"
+                and value.strip().lower() == b"100-continue"
+            ):
+                return True
+        return False
+
+    async def _receive_expect_continue(
+        self, request: Request
+    ) -> h11.Event | type[h11.PAUSED] | None:
+        timeouts = request.extensions.get("timeout", {})
+        timeout = timeouts.get("read", None)
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        while True:
+            read_timeout = timeout
+            if deadline is not None:
+                read_timeout = deadline - time.monotonic()
+                if read_timeout <= 0:
+                    return None
+
+            try:
+                event = await self._receive_event(timeout=read_timeout)
+            except ReadTimeout:
+                return None
+
+            if isinstance(event, h11.InformationalResponse):
+                if event.status_code in (100, 101):
+                    return None if event.status_code == 100 else event
+            elif event is not h11.PAUSED:
+                return event
 
     async def _receive_response_body(
         self, request: Request

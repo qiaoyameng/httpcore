@@ -13,6 +13,7 @@ from .._backends.base import NetworkStream
 from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
+    ReadTimeout,
     RemoteProtocolError,
     WriteError,
     map_exceptions,
@@ -57,6 +58,7 @@ class HTTP11Connection(ConnectionInterface):
         self._state = HTTPConnectionState.NEW
         self._state_lock = Lock()
         self._request_count = 0
+        self._response_event: h11.Event | type[h11.PAUSED] | None = None
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
             max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
@@ -84,8 +86,23 @@ class HTTP11Connection(ConnectionInterface):
                     "send_request_headers", logger, request, kwargs
                 ) as trace:
                     self._send_request_headers(**kwargs)
-                with Trace("send_request_body", logger, request, kwargs) as trace:
-                    self._send_request_body(**kwargs)
+                should_send_body = True
+                if self._expects_continue(request):
+                    with Trace(
+                        "receive_100_continue", logger, request, kwargs
+                    ) as trace:
+                        expect_continue_event = self._receive_expect_continue(
+                            **kwargs
+                        )
+                    should_send_body = expect_continue_event is None
+                    if expect_continue_event is not None:
+                        self._response_event = expect_continue_event
+
+                if should_send_body:
+                    with Trace(
+                        "send_request_body", logger, request, kwargs
+                    ) as trace:
+                        self._send_request_body(**kwargs)
             except WriteError:
                 # If we get a write error while we're writing the request,
                 # then we supress this error and move on to attempting to
@@ -154,9 +171,27 @@ class HTTP11Connection(ConnectionInterface):
         timeout = timeouts.get("write", None)
 
         assert isinstance(request.stream, typing.Iterable)
-        for chunk in request.stream:
-            event = h11.Data(data=chunk)
-            self._send_event(event, timeout=timeout)
+        body = request.stream
+        stream = body.__iter__()
+        try:
+            while True:
+                try:
+                    chunk = stream.__next__()
+                except StopIteration:
+                    break
+
+                event = h11.Data(data=chunk)
+                self._send_event(event, timeout=timeout)
+        except BaseException:
+            with ShieldCancellation():
+                close = getattr(stream, "close", None)
+                if close is not None:
+                    close()
+                if body is not stream:
+                    close_body = getattr(body, "close", None)
+                    if close_body is not None:
+                        close_body()
+            raise
 
         self._send_event(h11.EndOfMessage(), timeout=timeout)
 
@@ -174,7 +209,10 @@ class HTTP11Connection(ConnectionInterface):
         timeout = timeouts.get("read", None)
 
         while True:
-            event = self._receive_event(timeout=timeout)
+            event = self._response_event
+            self._response_event = None
+            if event is None:
+                event = self._receive_event(timeout=timeout)
             if isinstance(event, h11.Response):
                 break
             if (
@@ -192,6 +230,40 @@ class HTTP11Connection(ConnectionInterface):
         trailing_data, _ = self._h11_state.trailing_data
 
         return http_version, event.status_code, event.reason, headers, trailing_data
+
+    def _expects_continue(self, request: Request) -> bool:
+        for name, value in request.headers:
+            if (
+                name.lower() == b"expect"
+                and value.strip().lower() == b"100-continue"
+            ):
+                return True
+        return False
+
+    def _receive_expect_continue(
+        self, request: Request
+    ) -> h11.Event | type[h11.PAUSED] | None:
+        timeouts = request.extensions.get("timeout", {})
+        timeout = timeouts.get("read", None)
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        while True:
+            read_timeout = timeout
+            if deadline is not None:
+                read_timeout = deadline - time.monotonic()
+                if read_timeout <= 0:
+                    return None
+
+            try:
+                event = self._receive_event(timeout=read_timeout)
+            except ReadTimeout:
+                return None
+
+            if isinstance(event, h11.InformationalResponse):
+                if event.status_code in (100, 101):
+                    return None if event.status_code == 100 else event
+            elif event is not h11.PAUSED:
+                return event
 
     def _receive_response_body(
         self, request: Request

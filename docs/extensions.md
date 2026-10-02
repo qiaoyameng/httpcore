@@ -74,6 +74,10 @@ A dictionary of `str: Optional[float]` timeout values.
 
 May include values for `'connect'`, `'read'`, `'write'`, or `'pool'`.
 
+For HTTP/1.1 requests including an `Expect: 100-continue` header, the
+`'read'` timeout also determines how long to wait for `100 Continue` before
+sending the request body.
+
 For example:
 
 ```python

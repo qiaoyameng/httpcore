@@ -68,6 +68,48 @@ class SlowReadStream(httpcore.AsyncNetworkStream):
         await anyio.sleep(0)
 
 
+class ExpectContinueRequestBody:
+    def __init__(self) -> None:
+        self.read_count = 0
+        self.closed = False
+        self._sent = False
+
+    def __aiter__(self) -> "ExpectContinueRequestBody":
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._sent:
+            raise StopAsyncIteration
+        self.read_count += 1
+        self._sent = True
+        return b"request body"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class SlowExpectContinueWriteStream(httpcore.AsyncNetworkStream):
+    def __init__(self) -> None:
+        self.closed = False
+        self._buffer = [b"HTTP/1.1 100 Continue\r\n\r\n"]
+
+    async def read(
+        self, max_bytes: int, timeout: typing.Optional[float] = None
+    ) -> bytes:
+        if not self._buffer:
+            return b""
+        return self._buffer.pop(0)
+
+    async def write(
+        self, buffer: bytes, timeout: typing.Optional[float] = None
+    ) -> None:
+        if b"request body" in buffer:
+            await anyio.sleep(999)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 class SlowWriteBackend(httpcore.AsyncNetworkBackend):
     async def connect_tcp(
         self,
@@ -146,6 +188,25 @@ async def test_h11_timeout_during_request():
     async with httpcore.AsyncHTTP11Connection(origin, stream) as conn:
         with anyio.move_on_after(0.01):
             await conn.request("GET", "http://example.com")
+        assert conn.is_closed()
+
+
+@pytest.mark.anyio
+async def test_h11_expect_continue_timeout_closes_started_body():
+    origin = httpcore.Origin(b"http", b"example.com", 80)
+    stream = SlowExpectContinueWriteStream()
+    request_body = ExpectContinueRequestBody()
+    async with httpcore.AsyncHTTP11Connection(origin, stream) as conn:
+        with anyio.move_on_after(0.01):
+            await conn.request(
+                "POST",
+                "http://example.com",
+                headers={"Expect": "100-continue"},
+                content=request_body,
+            )
+
+        assert request_body.read_count == 1
+        assert request_body.closed
         assert conn.is_closed()
 
 

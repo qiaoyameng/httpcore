@@ -1,6 +1,105 @@
+import time
+import typing
+
 import pytest
 
 import httpcore
+
+
+class ExpectContinueRequestBody:
+    def __init__(self) -> None:
+        self.read_count = 0
+        self.first_read_at: float | None = None
+        self.closed = False
+        self._sent = False
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        return self
+
+    def __next__(self) -> bytes:
+        if self._sent:
+            raise StopIteration
+        self.first_read_at = time.monotonic()
+        self.read_count += 1
+        self._sent = True
+        return b"Hello, world!"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class OuterExpectContinueRequestBody:
+    def __init__(self) -> None:
+        self.read_count = 0
+        self.first_read_at: float | None = None
+        self.closed = False
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        outer = self
+
+        def iterate() -> typing.Iterator[bytes]:
+            outer.first_read_at = time.monotonic()
+            outer.read_count += 1
+            yield b"Hello, world!"
+
+        return iterate()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ExpectContinueStream(httpcore.NetworkStream):
+    def __init__(
+        self,
+        buffer: list[bytes],
+        *,
+        read_timeouts: list[float | None] | None = None,
+        timeout_reads: set[int] | None = None,
+        slow_reads: set[int] | None = None,
+    ) -> None:
+        self._buffer = buffer
+        self._read_timeouts = read_timeouts
+        self._timeout_reads = timeout_reads or set()
+        self._slow_reads = slow_reads or set()
+        self._read_count = 0
+        self.written = b""
+        self.closed = False
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        self._read_count += 1
+        if self._read_count in self._slow_reads:
+            time.sleep(0.01)
+        if self._read_timeouts is not None:
+            self._read_timeouts.append(timeout)
+        if self._read_count in self._timeout_reads:
+            raise httpcore.ReadTimeout
+        if not self._buffer:
+            return b""
+        return self._buffer.pop(0)
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.written += buffer
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class RequestBodyWriteFailureStream(httpcore.NetworkStream):
+    def __init__(self) -> None:
+        self.closed = False
+        self._buffer = [b"HTTP/1.1 100 Continue\r\n\r\n"]
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        if not self._buffer:
+            return b""
+        return self._buffer.pop(0)
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        if b"Hello, world!" in buffer:
+            raise httpcore.WriteError
+
+    def close(self) -> None:
+        self.closed = True
 
 
 
@@ -232,6 +331,138 @@ def test_http11_expect_continue():
         )
         assert response.status == 200
         assert response.content == b"Hello, world!"
+
+
+
+def test_http11_expect_continue_waits_before_reading_body():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    request_body = ExpectContinueRequestBody()
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+        ]
+    )
+
+    started_at = time.monotonic()
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=request_body,
+            extensions={"timeout": {"read": 1.0}},
+        )
+
+    assert response.status == 200
+    assert request_body.read_count == 1
+    assert request_body.first_read_at is not None
+    assert request_body.first_read_at >= started_at
+    assert b"Hello, world!" in stream.written
+
+
+
+@pytest.mark.parametrize("status", [401, 413])
+def test_http11_expect_continue_early_rejection_does_not_read_body(status):
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    request_body = ExpectContinueRequestBody()
+    reason = "Unauthorized" if status == 401 else "Payload Too Large"
+    stream = ExpectContinueStream(
+        [f"HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n".encode()]
+    )
+
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=request_body,
+            extensions={"timeout": {"read": 1.0}},
+        )
+
+    assert response.status == status
+    assert request_body.read_count == 0
+    assert request_body.first_read_at is None
+    assert b"Hello, world!" not in stream.written
+    assert stream.closed
+
+
+
+def test_http11_expect_continue_timeout_starts_body_once():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    request_body = ExpectContinueRequestBody()
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+        ],
+        timeout_reads={1},
+    )
+
+    started_at = time.monotonic()
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=request_body,
+            extensions={"timeout": {"read": 0.001}},
+        )
+
+    assert response.status == 200
+    assert request_body.read_count == 1
+    assert request_body.first_read_at is not None
+    assert request_body.first_read_at >= started_at
+    assert stream.written.count(b"Hello, world!") == 1
+
+
+
+def test_http11_expect_continue_103_does_not_reset_wait_window():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    request_body = ExpectContinueRequestBody()
+    read_timeouts: list[float | None] = []
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 103 Early Hints\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+        ],
+        read_timeouts=read_timeouts,
+        slow_reads={1},
+    )
+
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=request_body,
+            extensions={"timeout": {"read": 0.03}},
+        )
+
+    assert response.status == 200
+    assert read_timeouts[1] is not None
+    assert read_timeouts[1] < read_timeouts[0]
+
+
+
+def test_http11_expect_continue_send_failure_closes_body():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    request_body = OuterExpectContinueRequestBody()
+    stream = RequestBodyWriteFailureStream()
+
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(httpcore.RemoteProtocolError):
+            conn.request(
+                "POST",
+                "https://example.com/",
+                headers={"Expect": "100-continue"},
+                content=request_body,
+                extensions={"timeout": {"read": 1.0}},
+            )
+
+    assert request_body.read_count == 1
+    assert request_body.closed
+    assert stream.closed
 
 
 

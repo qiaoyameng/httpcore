@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Support `Expect: 100-continue` for HTTP/1.1 request bodies, using the
+  configured read timeout as the wait window.
 
 ## Version 1.0.9 (April 24th, 2025)
 
