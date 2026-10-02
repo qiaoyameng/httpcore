@@ -118,6 +118,8 @@ class SOCKSProxy(ConnectionPool):  # pragma: nocover
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
+        origin_fairness: bool = False,
+        max_connections_per_origin: int | None = None,
         network_backend: NetworkBackend | None = None,
     ) -> None:
         """
@@ -142,6 +144,9 @@ class SOCKSProxy(ConnectionPool):  # pragma: nocover
                 the connection pool. Defaults to False.
             retries: The maximum number of retries when trying to establish
                 a connection.
+            origin_fairness: When `True`, queue requests per origin and rotate
+                assignment between origins.
+            max_connections_per_origin: An optional maximum occupancy for one origin.
             local_address: Local address to connect from. Can also be used to
                 connect using a particular address family. Using
                 `local_address="0.0.0.0"` will connect using an `AF_INET` address
@@ -157,6 +162,8 @@ class SOCKSProxy(ConnectionPool):  # pragma: nocover
             keepalive_expiry=keepalive_expiry,
             http1=http1,
             http2=http2,
+            origin_fairness=origin_fairness,
+            max_connections_per_origin=max_connections_per_origin,
             network_backend=network_backend,
             retries=retries,
         )
@@ -316,6 +323,15 @@ class Socks5Connection(ConnectionInterface):
                 and not self._connect_failed
             )
         return self._connection.is_available()
+
+    def is_multiplexed(self) -> bool:
+        if self._connection is None:
+            return (
+                self._http2
+                and (self._remote_origin.scheme == b"https" or not self._http1)
+                and not self._connect_failed
+            )
+        return self._connection.is_multiplexed()
 
     def has_expired(self) -> bool:
         if self._connection is None:  # pragma: nocover

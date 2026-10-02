@@ -7,6 +7,12 @@ import pytest
 import trio as concurrency
 
 import httpcore
+from tests._fairness import (
+    FakeConnection,
+    add_request,
+    install_fake_connections,
+    origin,
+)
 
 
 @pytest.mark.anyio
@@ -835,3 +841,134 @@ async def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_rotates_released_connection_opportunities():
+    pool = httpcore.AsyncConnectionPool(max_connections=1, origin_fairness=True)
+    created = []
+    install_fake_connections(pool, created)
+
+    active_a = add_request(pool, "a.com")
+    closing = pool._assign_requests_to_connections()
+    await pool._close_connections(closing)
+    assert created == ["a.com"]
+
+    add_request(pool, "a.com")
+    add_request(pool, "a.com")
+    b_one = add_request(pool, "b.com")
+
+    assert pool._assign_requests_to_connections() == []
+    assert b_one.is_queued()
+
+    pool._requests.remove(active_a)
+    active_a.connection._idle = True
+    closing = pool._assign_requests_to_connections()
+    await pool._close_connections(closing)
+    assert created == ["a.com", "b.com"]
+    assert not b_one.is_queued()
+
+    b_one.connection._idle = True
+    b_two = add_request(pool, "b.com")
+    add_request(pool, "a.com")
+
+    closing = pool._assign_requests_to_connections()
+    await pool._close_connections(closing)
+    assert created == ["a.com", "b.com", "a.com"]
+    assert b_two.is_queued()
+    assert pool._assign_requests_to_connections() == []
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_timeout_does_not_consume_turn():
+    pool = httpcore.AsyncConnectionPool(max_connections=1, origin_fairness=True)
+    install_fake_connections(pool, [])
+
+    active_a = add_request(pool, "a.com")
+    pool._assign_requests_to_connections()
+
+    blocked_a = add_request(pool, "a.com")
+    blocked_b = add_request(pool, "b.com")
+    blocked_c = add_request(pool, "c.com")
+    pool._assign_requests_to_connections()
+
+    with pytest.raises(httpcore.PoolTimeout):
+        await blocked_b.wait_for_connection(timeout=0)
+    pool._requests.remove(blocked_b)
+    pool._requests.remove(active_a)
+    active_a.connection._idle = True
+
+    pool._assign_requests_to_connections()
+    assert not blocked_c.is_queued()
+    assert blocked_a.is_queued()
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_reuse_counts_toward_per_origin_cap():
+    idle_a = FakeConnection(origin("a.com"), available=True, idle=True)
+    active_b = FakeConnection(origin("b.com"))
+    pool = httpcore.AsyncConnectionPool(
+        max_connections=2,
+        origin_fairness=True,
+        max_connections_per_origin=1,
+    )
+    pool._connections.append(idle_a)
+    pool._connections.append(active_b)
+    created = []
+    install_fake_connections(pool, created)
+
+    add_request(pool, "a.com")
+    pool._assign_requests_to_connections()
+
+    idle_a._available = False
+    idle_a._idle = False
+    pool._requests.clear()
+    idle_a._available = True
+    idle_a._idle = True
+
+    add_request(pool, "a.com")
+    pool._assign_requests_to_connections()
+    assert created == []
+
+    add_request(pool, "c.com")
+    pool._assign_requests_to_connections()
+    assert created == ["c.com"]
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_http2_stream_close_releases_next_turn():
+    active_a = FakeConnection(origin("a.com"), available=True)
+    pool = httpcore.AsyncConnectionPool(max_connections=1, origin_fairness=True)
+    pool._connections.append(active_a)
+    created = []
+    install_fake_connections(pool, created)
+
+    first_a = add_request(pool, "a.com")
+    b_request = add_request(pool, "b.com")
+    pool._assign_requests_to_connections()
+
+    assert first_a.connection is active_a
+    assert b_request.is_queued()
+
+    pool._requests.remove(first_a)
+    active_a._idle = True
+    pool._assign_requests_to_connections()
+    assert not b_request.is_queued()
+    assert created == ["b.com"]
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_failed_connection_releases_opportunity():
+    pool = httpcore.AsyncConnectionPool(max_connections=1, origin_fairness=True)
+    created = []
+    install_fake_connections(pool, created)
+    request = httpcore.Request("GET", "http://a.com/")
+
+    with pytest.raises(httpcore.ConnectError):
+        await pool.handle_async_request(request)
+
+    assert pool.connections == []
+    b_request = add_request(pool, "b.com")
+    pool._assign_requests_to_connections()
+    assert created == ["a.com", "b.com"]
+    assert not b_request.is_queued()

@@ -9,6 +9,7 @@ from .._backends.sync import SyncBackend
 from .._backends.base import SOCKET_OPTION, NetworkBackend
 from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
 from .._models import Origin, Proxy, Request, Response
+from .._pool import OriginFairQueue, RequestAssignment
 from .._synchronization import Event, ShieldCancellation, ThreadLock
 from .connection import HTTPConnection
 from .interfaces import ConnectionInterface, RequestInterface
@@ -55,6 +56,8 @@ class ConnectionPool(RequestInterface):
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
+        origin_fairness: bool = False,
+        max_connections_per_origin: int | None = None,
         local_address: str | None = None,
         uds: str | None = None,
         network_backend: NetworkBackend | None = None,
@@ -80,6 +83,11 @@ class ConnectionPool(RequestInterface):
                 the connection pool. Defaults to False.
             retries: The maximum number of retries when trying to establish a
                 connection.
+            origin_fairness: When `True`, queue requests per origin and rotate
+                assignment between origins.
+            max_connections_per_origin: An optional maximum occupancy for a single
+                origin, including requests multiplexed onto one connection.
+                Idle origins do not reserve pool capacity.
             local_address: Local address to connect from. Can also be used to connect
                 using a particular address family. Using `local_address="0.0.0.0"`
                 will connect using an `AF_INET` address (IPv4), while using
@@ -107,6 +115,10 @@ class ConnectionPool(RequestInterface):
         self._http1 = http1
         self._http2 = http2
         self._retries = retries
+        self._origin_fairness = origin_fairness
+        if max_connections_per_origin is not None and max_connections_per_origin <= 0:
+            raise ValueError("max_connections_per_origin must be greater than zero")
+        self._max_connections_per_origin = max_connections_per_origin
         self._local_address = local_address
         self._uds = uds
 
@@ -119,6 +131,10 @@ class ConnectionPool(RequestInterface):
         # and the set of connections that are servicing those requests.
         self._connections: list[ConnectionInterface] = []
         self._requests: list[PoolRequest] = []
+        self._origin_queue = OriginFairQueue(
+            get_origin=lambda request: request.request.url.origin,
+            is_queued=PoolRequest.is_queued,
+        )
 
         # We only mutate the state of the connection pool within an 'optional_thread_lock'
         # context. This holds a threading lock unless we're running in async mode,
@@ -299,44 +315,101 @@ class ConnectionPool(RequestInterface):
                 closing_connections.append(connection)
 
         # Assign queued requests to connections.
-        queued_requests = [request for request in self._requests if request.is_queued()]
-        for pool_request in queued_requests:
-            origin = pool_request.request.url.origin
-            available_connections = [
-                connection
-                for connection in self._connections
-                if connection.can_handle_request(origin) and connection.is_available()
-            ]
-            idle_connections = [
-                connection for connection in self._connections if connection.is_idle()
-            ]
+        if self._origin_fairness and not any(
+            request.is_queued() for request in self._requests
+        ):
+            self._origin_queue.reset()
+        while True:
+            if self._origin_fairness:
+                pool_request = self._origin_queue.get(
+                    self._requests, self._get_request_assignment
+                )
+            else:
+                pool_request = None
+                for request in self._requests:
+                    if not request.is_queued():
+                        continue
+                    assignment = self._get_request_assignment(request)
+                    if assignment is RequestAssignment.BUSY:
+                        break
+                    if assignment is RequestAssignment.BLOCKED:
+                        continue
+                    pool_request = request
+                    break
 
-            # There are three cases for how we may be able to handle the request:
-            #
-            # 1. There is an existing connection that can handle the request.
-            # 2. We can create a new connection to handle the request.
-            # 3. We can close an idle connection and then create a new connection
-            #    to handle the request.
-            if available_connections:
-                # log: "reusing existing connection"
-                connection = available_connections[0]
-                pool_request.assign_to_connection(connection)
-            elif len(self._connections) < self._max_connections:
-                # log: "creating new connection"
-                connection = self.create_connection(origin)
-                self._connections.append(connection)
-                pool_request.assign_to_connection(connection)
-            elif idle_connections:
-                # log: "closing idle connection"
+            if pool_request is None:
+                break
+            self._assign_request_to_connection(pool_request, closing_connections)
+
+        return closing_connections
+
+    def _get_request_assignment(self, pool_request: PoolRequest) -> RequestAssignment:
+        origin = pool_request.request.url.origin
+        available_connections = [
+            connection
+            for connection in self._connections
+            if (
+                connection.can_handle_request(origin)
+                and connection.is_available()
+                and (connection.is_idle() or connection.is_multiplexed())
+            )
+        ]
+        origin_connections = [
+            connection
+            for connection in self._connections
+            if connection.can_handle_request(origin)
+        ]
+        active_requests = sum(
+            request.connection in origin_connections
+            for request in self._requests
+            if request.connection is not None
+        )
+        if available_connections:
+            return RequestAssignment.AVAILABLE
+
+        if (
+            self._max_connections_per_origin is not None
+            and active_requests >= self._max_connections_per_origin
+        ):
+            return RequestAssignment.BLOCKED
+
+        if len(self._connections) >= self._max_connections:
+            if any(connection.is_idle() for connection in self._connections):
+                return RequestAssignment.EVICTABLE
+            return RequestAssignment.BUSY
+
+        return RequestAssignment.ALLOWED
+
+    def _assign_request_to_connection(
+        self,
+        pool_request: PoolRequest,
+        closing_connections: list[ConnectionInterface],
+    ) -> None:
+        origin = pool_request.request.url.origin
+        available_connections = [
+            connection
+            for connection in self._connections
+            if (
+                connection.can_handle_request(origin)
+                and connection.is_available()
+                and (connection.is_idle() or connection.is_multiplexed())
+            )
+        ]
+        idle_connections = [
+            connection for connection in self._connections if connection.is_idle()
+        ]
+
+        if available_connections:
+            connection = available_connections[0]
+        else:
+            if len(self._connections) >= self._max_connections and idle_connections:
                 connection = idle_connections[0]
                 self._connections.remove(connection)
                 closing_connections.append(connection)
-                # log: "creating new connection"
-                connection = self.create_connection(origin)
-                self._connections.append(connection)
-                pool_request.assign_to_connection(connection)
+            connection = self.create_connection(origin)
+            self._connections.append(connection)
 
-        return closing_connections
+        pool_request.assign_to_connection(connection)
 
     def _close_connections(self, closing: list[ConnectionInterface]) -> None:
         # Close connections which have been removed from the pool.

@@ -8,7 +8,7 @@ import typing
 
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
-from .._exceptions import ConnectError, ConnectTimeout
+from .._exceptions import ConnectionNotAvailable, ConnectError, ConnectTimeout
 from .._models import Origin, Request, Response
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
@@ -71,9 +71,13 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
             raise RuntimeError(
                 f"Attempted to send request to {request.url.origin} on connection to {self._origin}"
             )
+        if self._connect_failed:
+            raise ConnectionNotAvailable()
 
         try:
             async with self._request_lock:
+                if self._connect_failed:
+                    raise ConnectionNotAvailable()
                 if self._connection is None:
                     stream = await self._connect(request)
 
@@ -181,8 +185,17 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                 self._http2
                 and (self._origin.scheme == b"https" or not self._http1)
                 and not self._connect_failed
-            )
+        )
         return self._connection.is_available()
+
+    def is_multiplexed(self) -> bool:
+        if self._connection is None:
+            return (
+                self._http2
+                and (self._origin.scheme == b"https" or not self._http1)
+                and not self._connect_failed
+            )
+        return self._connection.is_multiplexed()
 
     def has_expired(self) -> bool:
         if self._connection is None:

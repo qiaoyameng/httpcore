@@ -112,6 +112,13 @@ class AsyncConnectionInterface(AsyncRequestInterface):
         """
         raise NotImplementedError()  # pragma: nocover
 
+    def is_multiplexed(self) -> bool:
+        """
+        Return `True` if the connection can safely accept another request
+        while it is already servicing an existing request.
+        """
+        return False
+
     def has_expired(self) -> bool:
         """
         Return `True` if the connection is in a state where it should be closed.

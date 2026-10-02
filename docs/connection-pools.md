@@ -61,9 +61,15 @@ The connection pool instance is also the main point of configuration. Let's take
                      should allow. Any attempt to send a request on a pool that would
                      exceed this amount will block until a connection is available.
 * `max_keepalive_connections`: The maximum number of idle HTTP connections that will
-                               be maintained in the pool.
+                              be maintained in the pool.
 * `keepalive_expiry`: The duration in seconds that an idle HTTP connection may be
                       maintained for before being expired from the pool.
+* `origin_fairness`: Rotate newly released connection capacity between request
+                     origins. Requests within each origin remain in FIFO order.
+* `max_connections_per_origin`: The maximum occupancy allowed for one origin.
+                                Reusable HTTP/2 streams count toward the limit,
+                                while an origin with no requests does not reserve
+                                capacity.
 
 ### HTTP version support
 

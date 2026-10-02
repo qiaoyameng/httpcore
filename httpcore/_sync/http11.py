@@ -271,6 +271,9 @@ class HTTP11Connection(ConnectionInterface):
         # acquired from the connection pool for any other request.
         return self._state == HTTPConnectionState.IDLE
 
+    def is_multiplexed(self) -> bool:
+        return False
+
     def has_expired(self) -> bool:
         now = time.monotonic()
         keepalive_expired = self._expire_at is not None and now > self._expire_at
