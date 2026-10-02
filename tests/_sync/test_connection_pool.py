@@ -1,4 +1,5 @@
 import logging
+import threading
 import typing
 
 import hpack
@@ -8,6 +9,340 @@ from tests import concurrency
 
 import httpcore
 
+
+class ControlledStream:
+    def __init__(
+        self,
+        order: list[str],
+        label: str,
+        started: threading.Event,
+        release: threading.Event,
+        on_close: typing.Callable[[], None],
+    ) -> None:
+        self._order = order
+        self._label = label
+        self._started = started
+        self._release = release
+        self._on_close = on_close
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        self._started.set()
+        self._release.wait()
+        yield b""
+        self._on_close()
+        self._order.append(f"release:{self._label}")
+
+
+class ControlledConnection(httpcore.ConnectionInterface):
+    def __init__(
+        self,
+        origin: httpcore.Origin,
+        order: list[str],
+        events: dict[str, tuple[threading.Event, threading.Event]],
+        *,
+        multiplexed: bool = False,
+        max_requests: int = 1,
+    ) -> None:
+        self._origin = origin
+        self._order = order
+        self._events = events
+        self._multiplexed = multiplexed
+        self._max_requests = max_requests
+        self._active_requests = 0
+        self._request_count = 0
+        self._closed = False
+
+    def handle_request(self, request: httpcore.Request) -> httpcore.Response:
+        label = request.url.target.decode().lstrip("/")
+        self._active_requests += 1
+        self._request_count += 1
+        self._order.append(f"allocate:{label}")
+        started, release = self._events[label]
+        return httpcore.Response(
+            200,
+            content=ControlledStream(
+                self._order,
+                label,
+                started,
+                release,
+                self._release_request,
+            ),
+        )
+
+    def _release_request(self) -> None:
+        self._active_requests -= 1
+
+    def close(self) -> None:
+        self._closed = True
+
+    def info(self) -> str:
+        return f"controlled:{self._origin}:{self._request_count}"
+
+    def can_handle_request(self, origin: httpcore.Origin) -> bool:
+        return origin == self._origin
+
+    def is_available(self) -> bool:
+        if self._closed:
+            return False
+        if self._multiplexed:
+            return self._active_requests < self._max_requests
+        return self._active_requests == 0
+
+    def has_expired(self) -> bool:
+        return self._closed
+
+    def is_idle(self) -> bool:
+        return not self._closed and self._active_requests == 0
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+
+class ControlledConnectionPool(httpcore.ConnectionPool):
+    def __init__(
+        self,
+        order: list[str],
+        events: dict[str, tuple[threading.Event, threading.Event]],
+        **kwargs: typing.Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._order = order
+        self._events = events
+
+    def create_connection(self, origin: httpcore.Origin) -> httpcore.ConnectionInterface:
+        return ControlledConnection(origin, self._order, self._events)
+
+    def event(self, label: str, event_index: int) -> threading.Event:
+        return self._events[label][event_index]
+
+
+class MultiplexedControlledConnectionPool(ControlledConnectionPool):
+    def create_connection(self, origin: httpcore.Origin) -> httpcore.ConnectionInterface:
+        return ControlledConnection(
+            origin,
+            self._order,
+            self._events,
+            multiplexed=True,
+            max_requests=2,
+        )
+
+
+
+class CreatedCountingConnectionPool(ControlledConnectionPool):
+    def __init__(self, *args: typing.Any, **kwargs: typing.Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.creation_origins: list[str] = []
+
+    def create_connection(self, origin: httpcore.Origin) -> httpcore.ConnectionInterface:
+        self.creation_origins.append(str(origin))
+        return ControlledConnectionPool.create_connection(self, origin)
+
+
+class FailingConnectionPool(CreatedCountingConnectionPool):
+    def create_connection(self, origin: httpcore.Origin) -> httpcore.ConnectionInterface:
+        self.creation_origins.append(str(origin))
+        if str(origin) == "http://a.example:80":
+            raise httpcore.ConnectError("connection refused")
+        return ControlledConnectionPool.create_connection(self, origin)
+
+
+def event_pair(
+    events: dict[str, tuple[threading.Event, threading.Event]], label: str
+) -> tuple[threading.Event, threading.Event]:
+    pair = (threading.Event(), threading.Event())
+    events[label] = pair
+    return pair
+
+
+def start_request(
+    pool: ControlledConnectionPool,
+    events: dict[str, tuple[threading.Event, threading.Event]],
+    label: str,
+    origin_host: str,
+) -> threading.Thread:
+    event_pair(events, label)
+    thread = threading.Thread(
+        target=pool.request, args=("GET", f"http://{origin_host}/{label}")
+    )
+    thread.start()
+    return thread
+
+
+def test_origin_fairness_rotates_connection_opportunities():
+    order: list[str] = []
+    events: dict[str, tuple[threading.Event, threading.Event]] = {}
+    pool = ControlledConnectionPool(
+        order,
+        events,
+        max_connections=1,
+        origin_fairness=True,
+    )
+
+    with pool:
+        threads = {
+            "a0": start_request(pool, events, "a0", "a.example"),
+        }
+        pool.event("a0", 0).wait()
+        for label in ("a1", "a2", "a3"):
+            threads[label] = start_request(pool, events, label, "a.example")
+        threads["b0"] = start_request(pool, events, "b0", "b.example")
+
+        pool.event("a0", 1).set()
+        pool.event("b0", 0).wait()
+        pool.event("b0", 1).set()
+        pool.event("a1", 0).wait()
+
+        pool.event("a1", 1).set()
+        pool.event("a2", 0).wait()
+        pool.event("a2", 1).set()
+        threads["b1"] = start_request(pool, events, "b1", "b.example")
+        pool.event("b1", 0).wait()
+        pool.event("b1", 1).set()
+        pool.event("a3", 0).wait()
+        pool.event("a3", 1).set()
+
+        for thread in threads.values():
+            thread.join()
+
+    assert [item for item in order if item.startswith("allocate:")] == [
+        "allocate:a0",
+        "allocate:b0",
+        "allocate:a1",
+        "allocate:a2",
+        "allocate:b1",
+        "allocate:a3",
+    ]
+
+
+def test_origin_fairness_timeout_does_not_consume_turn():
+    order: list[str] = []
+    events: dict[str, tuple[threading.Event, threading.Event]] = {}
+    pool = ControlledConnectionPool(
+        order,
+        events,
+        max_connections=1,
+        origin_fairness=True,
+    )
+
+    with pool:
+        first = start_request(pool, events, "a0", "a.example")
+        pool.event("a0", 0).wait()
+
+        with pytest.raises(httpcore.PoolTimeout):
+            pool.request(
+                "GET",
+                "http://b.example/b0",
+                extensions={"timeout": {"pool": 0}},
+            )
+
+        c0_started = threading.Event()
+        c0_release = threading.Event()
+        events["c0"] = (c0_started, c0_release)
+        second = threading.Thread(
+            target=pool.request, args=("GET", "http://c.example/c0")
+        )
+        second.start()
+        pool.event("a0", 1).set()
+        first.join()
+        c0_started.wait()
+        c0_release.set()
+        second.join()
+
+    assert [item for item in order if item.startswith("allocate:")] == [
+        "allocate:a0",
+        "allocate:c0",
+    ]
+
+
+def test_origin_fairness_counts_multiplexed_connections():
+    order: list[str] = []
+    events: dict[str, tuple[threading.Event, threading.Event]] = {}
+    pool = MultiplexedControlledConnectionPool(
+        order,
+        events,
+        max_connections=1,
+        max_connections_per_origin=1,
+        origin_fairness=True,
+    )
+
+    with pool:
+        first = start_request(pool, events, "a0", "a.example")
+        pool.event("a0", 0).wait()
+        a1 = start_request(pool, events, "a1", "a.example")
+        pool.event("a1", 0).wait()
+        b0 = start_request(pool, events, "b0", "b.example")
+
+        pool.event("a0", 1).set()
+        pool.event("a1", 1).set()
+        pool.event("b0", 0).wait()
+        pool.event("b0", 1).set()
+
+        first.join()
+        a1.join()
+        b0.join()
+
+    assert [item for item in order if item.startswith("allocate:")] == [
+        "allocate:a0",
+        "allocate:a1",
+        "allocate:b0",
+    ]
+
+
+def test_origin_fairness_respects_max_connections_per_origin():
+    order: list[str] = []
+    events: dict[str, tuple[threading.Event, threading.Event]] = {}
+    pool = CreatedCountingConnectionPool(
+        order,
+        events,
+        max_connections=4,
+        origin_fairness=True,
+        max_connections_per_origin=1,
+    )
+
+    for label, origin in (("a0", "a.example"), ("b0", "b.example")):
+        event_pair(events, label)[1].set()
+
+    with pool:
+        first = threading.Thread(
+            target=pool.request, args=("GET", "http://a.example/a0")
+        )
+        second = threading.Thread(
+            target=pool.request, args=("GET", "http://b.example/b0")
+        )
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+
+    assert pool.creation_origins == [
+        "http://a.example:80",
+        "http://b.example:80",
+    ]
+
+
+def test_origin_fairness_releases_failed_connection_opportunity():
+    order: list[str] = []
+    events: dict[str, tuple[threading.Event, threading.Event]] = {}
+    pool = FailingConnectionPool(
+        order,
+        events,
+        max_connections=1,
+        origin_fairness=True,
+    )
+
+    with pool:
+        with pytest.raises(httpcore.ConnectError):
+            pool.request("GET", "http://a.example/a0")
+        assert pool.connections == []
+
+        event_pair(events, "b0")[1].set()
+        response = pool.request("GET", "http://b.example/b0")
+        assert response.status == 200
+
+    assert pool.creation_origins == [
+        "http://a.example:80",
+        "http://b.example:80",
+    ]
 
 
 def test_connection_pool_with_keepalive():

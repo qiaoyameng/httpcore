@@ -9,6 +9,7 @@ from .._backends.sync import SyncBackend
 from .._backends.base import SOCKET_OPTION, NetworkBackend
 from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
 from .._models import Origin, Proxy, Request, Response
+from .._pool import FairConnectionScheduler
 from .._synchronization import Event, ShieldCancellation, ThreadLock
 from .connection import HTTPConnection
 from .interfaces import ConnectionInterface, RequestInterface
@@ -18,14 +19,23 @@ class PoolRequest:
     def __init__(self, request: Request) -> None:
         self.request = request
         self.connection: ConnectionInterface | None = None
+        self.connection_created = False
+        self.handling_started = False
         self._connection_acquired = Event()
 
-    def assign_to_connection(self, connection: ConnectionInterface | None) -> None:
+    def assign_to_connection(
+        self,
+        connection: ConnectionInterface | None,
+        *,
+        connection_created: bool = False,
+    ) -> None:
         self.connection = connection
+        self.connection_created = connection_created
         self._connection_acquired.set()
 
     def clear_connection(self) -> None:
         self.connection = None
+        self.connection_created = False
         self._connection_acquired = Event()
 
     def wait_for_connection(
@@ -51,6 +61,8 @@ class ConnectionPool(RequestInterface):
         proxy: Proxy | None = None,
         max_connections: int | None = 10,
         max_keepalive_connections: int | None = None,
+        origin_fairness: bool = False,
+        max_connections_per_origin: int | None = None,
         keepalive_expiry: float | None = None,
         http1: bool = True,
         http2: bool = False,
@@ -72,6 +84,11 @@ class ConnectionPool(RequestInterface):
                 would exceed this amount will block until a connection is available.
             max_keepalive_connections: The maximum number of idle HTTP connections
                 that will be maintained in the pool.
+            origin_fairness: Rotate newly available connection opportunities
+                between requesting origins instead of serving the global queue
+                strictly in arrival order.
+            max_connections_per_origin: The maximum number of HTTP connections
+                assigned to a single origin when `origin_fairness` is enabled.
             keepalive_expiry: The duration in seconds that an idle HTTP connection
                 may be maintained for before being expired from the pool.
             http1: A boolean indicating if HTTP/1.1 requests should be supported
@@ -102,6 +119,10 @@ class ConnectionPool(RequestInterface):
         self._max_keepalive_connections = min(
             self._max_connections, self._max_keepalive_connections
         )
+        self._fair_scheduler = FairConnectionScheduler(
+            max_connections=self._max_connections,
+            max_connections_per_origin=max_connections_per_origin,
+        ) if origin_fairness else None
 
         self._keepalive_expiry = keepalive_expiry
         self._http1 = http1
@@ -233,6 +254,7 @@ class ConnectionPool(RequestInterface):
 
                 try:
                     # Send the request on the assigned connection.
+                    pool_request.handling_started = True
                     response = connection.handle_request(
                         pool_request.request
                     )
@@ -250,7 +272,26 @@ class ConnectionPool(RequestInterface):
                 # For any exception or cancellation we remove the request from
                 # the queue, and then re-assign requests to connections.
                 self._requests.remove(pool_request)
+                connection = pool_request.connection
+                if (
+                    connection is not None
+                    and not pool_request.handling_started
+                    and pool_request.connection_created
+                    and connection in self._connections
+                    and not connection.has_expired()
+                    and not connection.is_closed()
+                    and not any(
+                        request.connection is connection
+                        for request in self._requests
+                    )
+                ):
+                    self._connections.remove(connection)
+                    created_connection = connection
+                else:
+                    created_connection = None
                 closing = self._assign_requests_to_connections()
+                if created_connection is not None:
+                    closing.append(created_connection)
 
             self._close_connections(closing)
             raise exc from None
@@ -299,6 +340,43 @@ class ConnectionPool(RequestInterface):
                 closing_connections.append(connection)
 
         # Assign queued requests to connections.
+        if self._fair_scheduler is None:
+            self._assign_requests_fifo(closing_connections)
+        else:
+            fair_closing = self._fair_scheduler.assign(
+                requests=self._requests,
+                connections=self._connections,
+                origin=lambda request: request.request.url.origin,
+                is_queued=lambda request: request.is_queued(),
+                assigned_connection=lambda request: request.connection,
+                can_handle_request=lambda connection, origin: (
+                    connection.can_handle_request(origin)
+                ),
+                is_available=lambda connection: connection.is_available(),
+                is_idle=lambda connection: connection.is_idle(),
+                is_multiplexed=lambda connection: (
+                    connection.is_available() and not connection.is_idle()
+                ),
+                assign_to_connection=self._assign_pool_request,
+                create_connection=self.create_connection,
+            )
+            closing_connections.extend(fair_closing)
+
+        return closing_connections
+
+    def _assign_pool_request(
+        self,
+        pool_request: PoolRequest,
+        connection: ConnectionInterface,
+        connection_created: bool = False,
+    ) -> None:
+        pool_request.assign_to_connection(
+            connection, connection_created=connection_created
+        )
+
+    def _assign_requests_fifo(
+        self, closing_connections: list[ConnectionInterface]
+    ) -> None:
         queued_requests = [request for request in self._requests if request.is_queued()]
         for pool_request in queued_requests:
             origin = pool_request.request.url.origin
@@ -320,12 +398,14 @@ class ConnectionPool(RequestInterface):
             if available_connections:
                 # log: "reusing existing connection"
                 connection = available_connections[0]
-                pool_request.assign_to_connection(connection)
+                self._assign_pool_request(pool_request, connection)
             elif len(self._connections) < self._max_connections:
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
                 self._connections.append(connection)
-                pool_request.assign_to_connection(connection)
+                self._assign_pool_request(
+                    pool_request, connection, connection_created=True
+                )
             elif idle_connections:
                 # log: "closing idle connection"
                 connection = idle_connections[0]
@@ -334,9 +414,9 @@ class ConnectionPool(RequestInterface):
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
                 self._connections.append(connection)
-                pool_request.assign_to_connection(connection)
-
-        return closing_connections
+                self._assign_pool_request(
+                    pool_request, connection, connection_created=True
+                )
 
     def _close_connections(self, closing: list[ConnectionInterface]) -> None:
         # Close connections which have been removed from the pool.

@@ -64,6 +64,11 @@ The connection pool instance is also the main point of configuration. Let's take
                                be maintained in the pool.
 * `keepalive_expiry`: The duration in seconds that an idle HTTP connection may be
                       maintained for before being expired from the pool.
+* `origin_fairness`: A boolean indicating whether newly released connection
+                     opportunities should be shared between request origins in turn.
+                     Requests from the same origin remain served in arrival order.
+* `max_connections_per_origin`: The maximum number of HTTP connections assigned to
+                                a single origin when `origin_fairness=True`.
 
 ### HTTP version support
 

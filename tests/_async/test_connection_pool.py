@@ -1,12 +1,342 @@
 import logging
 import typing
 
+import anyio
 import hpack
 import hyperframe.frame
 import pytest
 import trio as concurrency
 
 import httpcore
+
+
+class AsyncControlledStream:
+    def __init__(
+        self,
+        order: list[str],
+        label: str,
+        release: anyio.Event,
+        on_close: typing.Callable[[], None],
+    ) -> None:
+        self._order = order
+        self._label = label
+        self._release = release
+        self._on_close = on_close
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        yield b""
+
+    async def aclose(self) -> None:
+        await self._release.wait()
+        self._on_close()
+        self._order.append(f"release:{self._label}")
+
+
+class AsyncControlledConnection(httpcore.AsyncConnectionInterface):
+    def __init__(
+        self,
+        origin: httpcore.Origin,
+        order: list[str],
+        releases: dict[str, anyio.Event],
+        *,
+        multiplexed: bool = False,
+        max_requests: int = 1,
+    ) -> None:
+        self._origin = origin
+        self._order = order
+        self._releases = releases
+        self._multiplexed = multiplexed
+        self._max_requests = max_requests
+        self._active_requests = 0
+        self._request_count = 0
+        self._closed = False
+
+    async def handle_async_request(self, request: httpcore.Request) -> httpcore.Response:
+        label = request.url.target.decode().lstrip("/")
+        self._active_requests += 1
+        self._request_count += 1
+        self._order.append(f"allocate:{label}")
+        return httpcore.Response(
+            200,
+            content=AsyncControlledStream(
+                self._order,
+                label,
+                self._releases[label],
+                self._release_request,
+            ),
+        )
+
+    def _release_request(self) -> None:
+        self._active_requests -= 1
+
+    async def aclose(self) -> None:
+        self._closed = True
+
+    def info(self) -> str:
+        return f"controlled:{self._origin}:{self._request_count}"
+
+    def can_handle_request(self, origin: httpcore.Origin) -> bool:
+        return origin == self._origin
+
+    def is_available(self) -> bool:
+        if self._closed:
+            return False
+        if self._multiplexed:
+            return self._active_requests < self._max_requests
+        return self._active_requests == 0
+
+    def has_expired(self) -> bool:
+        return self._closed
+
+    def is_idle(self) -> bool:
+        return not self._closed and self._active_requests == 0
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+
+class ControlledAsyncConnectionPool(httpcore.AsyncConnectionPool):
+    def __init__(
+        self,
+        order: list[str],
+        releases: dict[str, anyio.Event],
+        **kwargs: typing.Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._order = order
+        self._releases = releases
+
+    def create_connection(self, origin: httpcore.Origin) -> httpcore.AsyncConnectionInterface:
+        return AsyncControlledConnection(origin, self._order, self._releases)
+
+
+class MultiplexedAsyncConnectionPool(ControlledAsyncConnectionPool):
+    def create_connection(self, origin: httpcore.Origin) -> httpcore.AsyncConnectionInterface:
+        return AsyncControlledConnection(
+            origin,
+            self._order,
+            self._releases,
+            multiplexed=True,
+            max_requests=2,
+        )
+
+
+class CreatedCountingAsyncConnectionPool(ControlledAsyncConnectionPool):
+    def __init__(self, *args: typing.Any, **kwargs: typing.Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.creation_origins: list[str] = []
+
+    def create_connection(self, origin: httpcore.Origin) -> httpcore.AsyncConnectionInterface:
+        self.creation_origins.append(str(origin))
+        return super().create_connection(origin)
+
+
+class FailingAsyncConnectionPool(CreatedCountingAsyncConnectionPool):
+    def create_connection(self, origin: httpcore.Origin) -> httpcore.AsyncConnectionInterface:
+        self.creation_origins.append(str(origin))
+        if str(origin) == "http://a.example:80":
+            raise httpcore.ConnectError("connection refused")
+        return ControlledAsyncConnectionPool.create_connection(self, origin)
+
+
+def event(events: dict[str, anyio.Event], label: str) -> anyio.Event:
+    event = anyio.Event()
+    events[label] = event
+    return event
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_rotates_connection_opportunities():
+    order: list[str] = []
+    starts: dict[str, anyio.Event] = {}
+    releases: dict[str, anyio.Event] = {}
+    pool = ControlledAsyncConnectionPool(
+        order,
+        releases,
+        max_connections=1,
+        origin_fairness=True,
+    )
+
+    async def request(label: str, origin_host: str) -> None:
+        start = event(starts, label)
+        release = event(releases, label)
+        async with pool.stream("GET", f"http://{origin_host}/{label}"):
+            start.set()
+            await release.wait()
+
+    async with pool:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(request, "a0", "a.example")
+            await anyio.sleep(0)
+            await starts["a0"].wait()
+            for label in ("a1", "a2", "a3"):
+                task_group.start_soon(request, label, "a.example")
+            task_group.start_soon(request, "b0", "b.example")
+            await anyio.sleep(0.01)
+
+            releases["a0"].set()
+            await starts["b0"].wait()
+            releases["b0"].set()
+            await starts["a1"].wait()
+            releases["a1"].set()
+
+            await starts["a2"].wait()
+            releases["a2"].set()
+            event(releases, "b1")
+            task_group.start_soon(request, "b1", "b.example")
+            await anyio.sleep(0)
+            await starts["b1"].wait()
+            releases["b1"].set()
+            await starts["a3"].wait()
+            releases["a3"].set()
+
+    assert [item for item in order if item.startswith("allocate:")] == [
+        "allocate:a0",
+        "allocate:b0",
+        "allocate:a1",
+        "allocate:a2",
+        "allocate:b1",
+        "allocate:a3",
+    ]
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_timeout_does_not_consume_turn():
+    order: list[str] = []
+    starts: dict[str, anyio.Event] = {}
+    releases: dict[str, anyio.Event] = {}
+    pool = ControlledAsyncConnectionPool(
+        order,
+        releases,
+        max_connections=1,
+        origin_fairness=True,
+    )
+
+    async def request(label: str, origin_host: str) -> None:
+        start = event(starts, label)
+        release = event(releases, label)
+        async with pool.stream("GET", f"http://{origin_host}/{label}"):
+            start.set()
+            await release.wait()
+
+    async with pool:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(request, "a0", "a.example")
+            await anyio.sleep(0)
+            await starts["a0"].wait()
+            with pytest.raises(httpcore.PoolTimeout):
+                await pool.request(
+                    "GET",
+                    "http://b.example/b0",
+                    extensions={"timeout": {"pool": 0}},
+                )
+
+            task_group.start_soon(request, "c0", "c.example")
+            await anyio.sleep(0.01)
+            releases["a0"].set()
+            await starts["c0"].wait()
+            releases["c0"].set()
+
+    assert [item for item in order if item.startswith("allocate:")] == [
+        "allocate:a0",
+        "allocate:c0",
+    ]
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_counts_multiplexed_connections():
+    order: list[str] = []
+    starts: dict[str, anyio.Event] = {}
+    releases: dict[str, anyio.Event] = {}
+    pool = MultiplexedAsyncConnectionPool(
+        order,
+        releases,
+        max_connections=1,
+        max_connections_per_origin=1,
+        origin_fairness=True,
+    )
+
+    async def request(label: str, origin_host: str) -> None:
+        start = event(starts, label)
+        release = event(releases, label)
+        async with pool.stream("GET", f"http://{origin_host}/{label}"):
+            start.set()
+            await release.wait()
+
+    async with pool:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(request, "a0", "a.example")
+            await anyio.sleep(0)
+            await starts["a0"].wait()
+            task_group.start_soon(request, "a1", "a.example")
+            await anyio.sleep(0)
+            await starts["a1"].wait()
+            task_group.start_soon(request, "b0", "b.example")
+            await anyio.sleep(0.01)
+
+            releases["a0"].set()
+            releases["a1"].set()
+            await starts["b0"].wait()
+            releases["b0"].set()
+
+    assert [item for item in order if item.startswith("allocate:")] == [
+        "allocate:a0",
+        "allocate:a1",
+        "allocate:b0",
+    ]
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_respects_max_connections_per_origin():
+    order: list[str] = []
+    releases: dict[str, anyio.Event] = {}
+    pool = CreatedCountingAsyncConnectionPool(
+        order,
+        releases,
+        max_connections=4,
+        origin_fairness=True,
+        max_connections_per_origin=1,
+    )
+
+    async def request(label: str, origin_host: str) -> None:
+        event(releases, label).set()
+        await pool.request("GET", f"http://{origin_host}/{label}")
+
+    async with pool:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(request, "a0", "a.example")
+            task_group.start_soon(request, "b0", "b.example")
+            await anyio.sleep(0.01)
+    assert pool.creation_origins == [
+        "http://a.example:80",
+        "http://b.example:80",
+    ]
+
+
+@pytest.mark.anyio
+async def test_origin_fairness_releases_failed_connection_opportunity():
+    order: list[str] = []
+    releases: dict[str, anyio.Event] = {}
+    pool = FailingAsyncConnectionPool(
+        order,
+        releases,
+        max_connections=1,
+        origin_fairness=True,
+    )
+
+    async with pool:
+        with pytest.raises(httpcore.ConnectError):
+            await pool.request("GET", "http://a.example/a0")
+        assert pool.connections == []
+
+        event(releases, "b0").set()
+        response = await pool.request("GET", "http://b.example/b0")
+        assert response.status == 200
+
+    assert pool.creation_origins == [
+        "http://a.example:80",
+        "http://b.example:80",
+    ]
 
 
 @pytest.mark.anyio
