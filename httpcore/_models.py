@@ -5,6 +5,8 @@ import ssl
 import typing
 import urllib.parse
 
+from ._exceptions import RemoteProtocolError
+
 # Functions for typechecking...
 
 
@@ -14,6 +16,43 @@ HeadersAsMapping = typing.Mapping[ByteOrStr, ByteOrStr]
 HeaderTypes = typing.Union[HeadersAsSequence, HeadersAsMapping, None]
 
 Extensions = typing.MutableMapping[str, typing.Any]
+
+FORBIDDEN_TRAILER_FIELDS = frozenset(
+    {
+        b"authorization",
+        b"cache-control",
+        b"content-encoding",
+        b"content-length",
+        b"content-range",
+        b"content-type",
+        b"date",
+        b"expect",
+        b"expires",
+        b"host",
+        b"location",
+        b"max-forwards",
+        b"proxy-authenticate",
+        b"proxy-authorization",
+        b"range",
+        b"retry-after",
+        b"set-cookie",
+        b"te",
+        b"trailer",
+        b"transfer-encoding",
+        b"vary",
+        b"www-authenticate",
+    }
+)
+
+
+def enforce_trailers(
+    trailers: typing.Sequence[tuple[bytes, bytes]],
+) -> list[tuple[bytes, bytes]]:
+    normalized = [(name, value) for name, value in trailers]
+    for name, value in normalized:
+        if name.startswith(b":") or name.lower() in FORBIDDEN_TRAILER_FIELDS:
+            raise RemoteProtocolError(f"Forbidden trailer field: {name!r}.")
+    return normalized
 
 
 def enforce_bytes(value: bytes | str, *, name: str) -> bytes:
@@ -366,6 +405,11 @@ class Request:
 class Response:
     """
     An HTTP response.
+
+    The `trailers` attribute is `None` until the response body has completed.
+    It is an empty list if a completed response has no trailers. Trailers are
+    never included in `headers`, and accessing the attribute never reads the
+    response body.
     """
 
     def __init__(
@@ -398,6 +442,10 @@ class Response:
         self.extensions = {} if extensions is None else extensions
 
         self._stream_consumed = False
+        self.trailers: list[tuple[bytes, bytes]] | None = None
+
+    def _set_trailers(self, trailers: list[tuple[bytes, bytes]]) -> None:
+        self.trailers = enforce_trailers(trailers)
 
     @property
     def content(self) -> bytes:

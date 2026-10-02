@@ -378,3 +378,122 @@ def test_http11_header_sub_100kb():
         response = conn.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b""
+
+
+
+def test_http11_empty_body_with_trailers():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"Trailer: X-Checksum\r\n",
+            b"\r\n",
+            b"0\r\nX-Checksum: abc\r\n\r\n",
+        ]
+    )
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request("GET", "https://example.com/")
+        assert response.content == b""
+        assert response.headers == [
+            (b"Transfer-Encoding", b"chunked"),
+            (b"Trailer", b"X-Checksum"),
+        ]
+        assert response.trailers == [(b"X-Checksum", b"abc")]
+
+
+
+def test_http11_chunked_trailers_are_reusable():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"Trailer: X-Checksum\r\n\r\n",
+            b"3\r\nabc\r\n",
+            b"3\r\ndef\r\n",
+            b"0\r\n",
+            b"X-Checksum: abc\r\n",
+            b"X-Checksum: def\r\n\r\n",
+            (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 2\r\n\r\n"
+                b"ok"
+            ),
+        ]
+    )
+    with httpcore.HTTP11Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            assert response.trailers is None
+            chunks = [chunk for chunk in response.iter_stream()]
+            assert chunks == [b"abc", b"def"]
+            expected = [
+                (b"X-Checksum", b"abc"),
+                (b"X-Checksum", b"def"),
+            ]
+            assert response.trailers == expected
+            assert response.trailers is response.trailers
+
+        assert conn.is_idle()
+        assert conn.is_available()
+
+        response = conn.request("GET", "https://example.com/")
+        assert response.content == b"ok"
+        assert response.trailers == []
+
+
+
+def test_http11_trailers_after_early_close():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"3\r\nabc\r\n",
+            b"3\r\ndef\r\n0\r\nX-Checksum: abc\r\n\r\n",
+        ]
+    )
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            for chunk in response.iter_stream():
+                assert chunk == b"abc"
+                break
+            response.close()
+            assert response.trailers is None
+
+        assert conn.is_closed()
+        assert not conn.is_available()
+
+
+
+def test_http11_trailers_with_forbidden_field():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"0\r\nContent-Length: 0\r\n\r\n",
+        ]
+    )
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            with pytest.raises(httpcore.RemoteProtocolError):
+                response.read()
+            assert response.trailers is None
+
+
+
+def test_http11_truncated_trailers():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"3\r\nabc\r\n",
+            b"",
+        ]
+    )
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            with pytest.raises(httpcore.RemoteProtocolError):
+                response.read()
+            assert response.trailers is None

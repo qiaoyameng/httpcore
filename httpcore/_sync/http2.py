@@ -18,7 +18,7 @@ from .._exceptions import (
     LocalProtocolError,
     RemoteProtocolError,
 )
-from .._models import Origin, Request, Response
+from .._models import Origin, Request, Response, enforce_trailers
 from .._synchronization import Lock, Semaphore, ShieldCancellation
 from .._trace import Trace
 from .interfaces import ConnectionInterface
@@ -70,6 +70,7 @@ class HTTP2Connection(ConnectionInterface):
             list[
                 h2.events.ResponseReceived
                 | h2.events.DataReceived
+                | h2.events.TrailersReceived
                 | h2.events.StreamEnded
                 | h2.events.StreamReset,
             ],
@@ -152,16 +153,21 @@ class HTTP2Connection(ConnectionInterface):
                 )
                 trace.return_value = (status, headers)
 
-            return Response(
+            response_stream = HTTP2ConnectionByteStream(
+                self, request, stream_id=stream_id
+            )
+            response = Response(
                 status=status,
                 headers=headers,
-                content=HTTP2ConnectionByteStream(self, request, stream_id=stream_id),
+                content=response_stream,
                 extensions={
                     "http_version": b"HTTP/2",
                     "network_stream": self._network_stream,
                     "stream_id": stream_id,
                 },
             )
+            response_stream._response = response
+            return response
         except BaseException as exc:  # noqa: PIE786
             with ShieldCancellation():
                 kwargs = {"stream_id": stream_id}
@@ -307,7 +313,10 @@ class HTTP2Connection(ConnectionInterface):
         return (status_code, headers)
 
     def _receive_response_body(
-        self, request: Request, stream_id: int
+        self,
+        request: Request,
+        stream_id: int,
+        response_stream: "HTTP2ConnectionByteStream",
     ) -> typing.Iterator[bytes]:
         """
         Iterator that returns the bytes of the response body for a given stream ID.
@@ -321,12 +330,23 @@ class HTTP2Connection(ConnectionInterface):
                 self._h2_state.acknowledge_received_data(amount, stream_id)
                 self._write_outgoing_data(request)
                 yield event.data
+            elif isinstance(event, h2.events.TrailersReceived):
+                response_stream.set_trailers(
+                    enforce_trailers(list(event.headers))
+                )
             elif isinstance(event, h2.events.StreamEnded):
+                if response_stream.get_trailers() is None:
+                    response_stream.set_trailers([])
                 break
 
     def _receive_stream_event(
         self, request: Request, stream_id: int
-    ) -> h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded:
+    ) -> (
+        h2.events.ResponseReceived
+        | h2.events.DataReceived
+        | h2.events.TrailersReceived
+        | h2.events.StreamEnded
+    ):
         """
         Return the next available event for a given stream ID.
 
@@ -375,6 +395,7 @@ class HTTP2Connection(ConnectionInterface):
                         (
                             h2.events.ResponseReceived,
                             h2.events.DataReceived,
+                            h2.events.TrailersReceived,
                             h2.events.StreamEnded,
                             h2.events.StreamReset,
                         ),
@@ -567,13 +588,16 @@ class HTTP2ConnectionByteStream:
         self._request = request
         self._stream_id = stream_id
         self._closed = False
+        self._response: Response | None = None
 
     def __iter__(self) -> typing.Iterator[bytes]:
         kwargs = {"request": self._request, "stream_id": self._stream_id}
         try:
             with Trace("receive_response_body", logger, self._request, kwargs):
                 for chunk in self._connection._receive_response_body(
-                    request=self._request, stream_id=self._stream_id
+                    request=self._request,
+                    stream_id=self._stream_id,
+                    response_stream=self,
                 ):
                     yield chunk
         except BaseException as exc:
@@ -583,6 +607,14 @@ class HTTP2ConnectionByteStream:
             with ShieldCancellation():
                 self.close()
             raise exc
+
+    def set_trailers(self, trailers: list[tuple[bytes, bytes]]) -> None:
+        assert self._response is not None
+        self._response._set_trailers(trailers)
+
+    def get_trailers(self) -> list[tuple[bytes, bytes]] | None:
+        assert self._response is not None
+        return self._response.trailers
 
     def close(self) -> None:
         if not self._closed:

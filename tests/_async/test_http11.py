@@ -378,3 +378,122 @@ async def test_http11_header_sub_100kb():
         response = await conn.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b""
+
+
+@pytest.mark.anyio
+async def test_http11_empty_body_with_trailers():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"Trailer: X-Checksum\r\n",
+            b"\r\n",
+            b"0\r\nX-Checksum: abc\r\n\r\n",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request("GET", "https://example.com/")
+        assert response.content == b""
+        assert response.headers == [
+            (b"Transfer-Encoding", b"chunked"),
+            (b"Trailer", b"X-Checksum"),
+        ]
+        assert response.trailers == [(b"X-Checksum", b"abc")]
+
+
+@pytest.mark.anyio
+async def test_http11_chunked_trailers_are_reusable():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"Trailer: X-Checksum\r\n\r\n",
+            b"3\r\nabc\r\n",
+            b"3\r\ndef\r\n",
+            b"0\r\n",
+            b"X-Checksum: abc\r\n",
+            b"X-Checksum: def\r\n\r\n",
+            (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 2\r\n\r\n"
+                b"ok"
+            ),
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        async with conn.stream("GET", "https://example.com/") as response:
+            assert response.trailers is None
+            chunks = [chunk async for chunk in response.aiter_stream()]
+            assert chunks == [b"abc", b"def"]
+            expected = [
+                (b"X-Checksum", b"abc"),
+                (b"X-Checksum", b"def"),
+            ]
+            assert response.trailers == expected
+            assert response.trailers is response.trailers
+
+        assert conn.is_idle()
+        assert conn.is_available()
+
+        response = await conn.request("GET", "https://example.com/")
+        assert response.content == b"ok"
+        assert response.trailers == []
+
+
+@pytest.mark.anyio
+async def test_http11_trailers_after_early_close():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"3\r\nabc\r\n",
+            b"3\r\ndef\r\n0\r\nX-Checksum: abc\r\n\r\n",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        async with conn.stream("GET", "https://example.com/") as response:
+            async for chunk in response.aiter_stream():
+                assert chunk == b"abc"
+                break
+            await response.aclose()
+            assert response.trailers is None
+
+        assert conn.is_closed()
+        assert not conn.is_available()
+
+
+@pytest.mark.anyio
+async def test_http11_trailers_with_forbidden_field():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"0\r\nContent-Length: 0\r\n\r\n",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        async with conn.stream("GET", "https://example.com/") as response:
+            with pytest.raises(httpcore.RemoteProtocolError):
+                await response.aread()
+            assert response.trailers is None
+
+
+@pytest.mark.anyio
+async def test_http11_truncated_trailers():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"3\r\nabc\r\n",
+            b"",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        async with conn.stream("GET", "https://example.com/") as response:
+            with pytest.raises(httpcore.RemoteProtocolError):
+                await response.aread()
+            assert response.trailers is None

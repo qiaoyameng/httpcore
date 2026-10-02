@@ -144,6 +144,25 @@ with httpcore.stream('GET', 'https://example.com') as response:
     response.read()  # `response.content` is now available.
 ```
 
+HTTP trailers are available on `response.trailers` after the body has been
+read to completion. The value is `None` before the body is complete and after
+an early close, and is an empty list when the completed response had no
+trailers. The original order and repeated values are preserved:
+
+```python
+with httpcore.stream('GET', 'https://example.com') as response:
+    assert response.trailers is None
+    response.read()
+    assert response.trailers == [
+        (b'X-Checksum', b'abc'),
+        (b'X-Checksum', b'def'),
+    ]
+```
+
+Accessing `response.trailers` never reads response data. If malformed trailers
+or another protocol error is encountered while consuming the body, reading the
+stream raises `httpcore.RemoteProtocolError`; trailers remain unavailable.
+
 ---
 
 # Reference

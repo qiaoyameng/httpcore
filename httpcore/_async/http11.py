@@ -17,7 +17,7 @@ from .._exceptions import (
     WriteError,
     map_exceptions,
 )
-from .._models import Origin, Request, Response
+from .._models import Origin, Request, Response, enforce_trailers
 from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .interfaces import AsyncConnectionInterface
@@ -119,16 +119,19 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
             ):
                 network_stream = AsyncHTTP11UpgradeStream(network_stream, trailing_data)
 
-            return Response(
+            response_stream = HTTP11ConnectionByteStream(self, request)
+            response = Response(
                 status=status,
                 headers=headers,
-                content=HTTP11ConnectionByteStream(self, request),
+                content=response_stream,
                 extensions={
                     "http_version": http_version,
                     "reason_phrase": reason_phrase,
                     "network_stream": network_stream,
                 },
             )
+            response_stream._response = response
+            return response
         except BaseException as exc:
             with AsyncShieldCancellation():
                 async with Trace("response_closed", logger, request) as trace:
@@ -194,7 +197,7 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         return http_version, event.status_code, event.reason, headers, trailing_data
 
     async def _receive_response_body(
-        self, request: Request
+        self, request: Request, response_stream: "HTTP11ConnectionByteStream"
     ) -> typing.AsyncIterator[bytes]:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("read", None)
@@ -203,7 +206,11 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
             event = await self._receive_event(timeout=timeout)
             if isinstance(event, h11.Data):
                 yield bytes(event.data)
-            elif isinstance(event, (h11.EndOfMessage, h11.PAUSED)):
+            elif isinstance(event, h11.EndOfMessage):
+                trailers = enforce_trailers(event.headers.raw_items())
+                response_stream.set_trailers(trailers)
+                break
+            elif event is h11.PAUSED:
                 break
 
     async def _receive_event(
@@ -326,12 +333,15 @@ class HTTP11ConnectionByteStream:
         self._connection = connection
         self._request = request
         self._closed = False
+        self._response: Response | None = None
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
         kwargs = {"request": self._request}
         try:
             async with Trace("receive_response_body", logger, self._request, kwargs):
-                async for chunk in self._connection._receive_response_body(**kwargs):
+                async for chunk in self._connection._receive_response_body(
+                    **kwargs, response_stream=self
+                ):
                     yield chunk
         except BaseException as exc:
             # If we get an exception while streaming the response,
@@ -340,6 +350,10 @@ class HTTP11ConnectionByteStream:
             with AsyncShieldCancellation():
                 await self.aclose()
             raise exc
+
+    def set_trailers(self, trailers: list[tuple[bytes, bytes]]) -> None:
+        assert self._response is not None
+        self._response._set_trailers(trailers)
 
     async def aclose(self) -> None:
         if not self._closed:
