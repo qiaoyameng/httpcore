@@ -21,6 +21,7 @@ from .._exceptions import (
 from .._models import Origin, Request, Response
 from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
 from .._trace import Trace
+from .._trailers import ResponseTrailers
 from .interfaces import AsyncConnectionInterface
 
 logger = logging.getLogger("httpcore.http2")
@@ -63,6 +64,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         self._sent_connection_init = False
         self._used_all_stream_ids = False
         self._connection_error = False
+        self._response_protocol_error = False
 
         # Mapping from stream ID to response stream events.
         self._events: dict[
@@ -70,6 +72,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             list[
                 h2.events.ResponseReceived
                 | h2.events.DataReceived
+                | h2.events.TrailersReceived
                 | h2.events.StreamEnded
                 | h2.events.StreamReset,
             ],
@@ -152,10 +155,13 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 )
                 trace.return_value = (status, headers)
 
+            trailers = ResponseTrailers()
             return Response(
                 status=status,
                 headers=headers,
-                content=HTTP2ConnectionByteStream(self, request, stream_id=stream_id),
+                content=HTTP2ConnectionByteStream(
+                    self, request, stream_id=stream_id, trailers=trailers
+                ),
                 extensions={
                     "http_version": b"HTTP/2",
                     "network_stream": self._network_stream,
@@ -307,7 +313,10 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         return (status_code, headers)
 
     async def _receive_response_body(
-        self, request: Request, stream_id: int
+        self,
+        request: Request,
+        stream_id: int,
+        trailers: ResponseTrailers,
     ) -> typing.AsyncIterator[bytes]:
         """
         Iterator that returns the bytes of the response body for a given stream ID.
@@ -321,12 +330,25 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 self._h2_state.acknowledge_received_data(amount, stream_id)
                 await self._write_outgoing_data(request)
                 yield event.data
+            elif isinstance(event, h2.events.TrailersReceived):
+                try:
+                    trailers.set(event.headers)
+                except RemoteProtocolError:
+                    self._response_protocol_error = True
+                    raise
             elif isinstance(event, h2.events.StreamEnded):
+                if trailers.headers is None:
+                    trailers.set([])
                 break
 
     async def _receive_stream_event(
         self, request: Request, stream_id: int
-    ) -> h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded:
+    ) -> (
+        h2.events.ResponseReceived
+        | h2.events.DataReceived
+        | h2.events.TrailersReceived
+        | h2.events.StreamEnded
+    ):
         """
         Return the next available event for a given stream ID.
 
@@ -375,6 +397,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                         (
                             h2.events.ResponseReceived,
                             h2.events.DataReceived,
+                            h2.events.TrailersReceived,
                             h2.events.StreamEnded,
                             h2.events.StreamReset,
                         ),
@@ -410,7 +433,9 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         await self._max_streams_semaphore.release()
         del self._events[stream_id]
         async with self._state_lock:
-            if self._connection_terminated and not self._events:
+            if self._response_protocol_error:
+                await self.aclose()
+            elif self._connection_terminated and not self._events:
                 await self.aclose()
 
             elif self._state == HTTPConnectionState.ACTIVE and not self._events:
@@ -561,11 +586,16 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
 class HTTP2ConnectionByteStream:
     def __init__(
-        self, connection: AsyncHTTP2Connection, request: Request, stream_id: int
+        self,
+        connection: AsyncHTTP2Connection,
+        request: Request,
+        stream_id: int,
+        trailers: ResponseTrailers,
     ) -> None:
         self._connection = connection
         self._request = request
         self._stream_id = stream_id
+        self._trailers = trailers
         self._closed = False
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
@@ -573,7 +603,9 @@ class HTTP2ConnectionByteStream:
         try:
             async with Trace("receive_response_body", logger, self._request, kwargs):
                 async for chunk in self._connection._receive_response_body(
-                    request=self._request, stream_id=self._stream_id
+                    request=self._request,
+                    stream_id=self._stream_id,
+                    trailers=self._trailers,
                 ):
                     yield chunk
         except BaseException as exc:

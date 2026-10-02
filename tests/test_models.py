@@ -113,6 +113,7 @@ def test_response():
     assert response.status == 200
     assert response.headers == []
     assert response.extensions == {}
+    assert response.trailers is None
     assert repr(response) == "<Response [200]>"
     assert repr(response.stream) == "<ByteStream [0 bytes]>"
 

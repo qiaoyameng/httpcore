@@ -380,3 +380,168 @@ def test_http2_remote_max_streams_update():
                         conn._h2_state.local_settings.max_concurrent_streams,
                     )
                 i += 1
+
+
+def _trailer_stream(body, trailers):
+    encoder = hpack.Encoder()
+    frames = [
+        hyperframe.frame.SettingsFrame().serialize(),
+        hyperframe.frame.HeadersFrame(
+            stream_id=1,
+            data=encoder.encode([(b":status", b"200")]),
+            flags=["END_HEADERS"],
+        ).serialize(),
+    ]
+    for chunk in body:
+        frames.append(
+            hyperframe.frame.DataFrame(stream_id=1, data=chunk).serialize()
+        )
+    trailer_encoder = hpack.Encoder()
+    frames.append(
+        hyperframe.frame.HeadersFrame(
+            stream_id=1,
+            data=trailer_encoder.encode(trailers),
+            flags=["END_STREAM", "END_HEADERS"],
+        ).serialize()
+    )
+    return httpcore.MockStream(frames)
+
+
+
+def test_http2_trailers_empty_body():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = _trailer_stream([], [(b"X-Checksum", b"empty")])
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            assert response.headers == []
+            assert response.trailers is None
+            assert response.read() == b""
+            assert response.trailers == [(b"X-Checksum", b"empty")]
+            assert response.trailers is response.trailers
+
+
+
+def test_http2_connection_reuse_after_trailers():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    encoder = hpack.Encoder()
+    frames = [
+        hyperframe.frame.SettingsFrame().serialize(),
+        hyperframe.frame.HeadersFrame(
+            stream_id=1,
+            data=encoder.encode([(b":status", b"200")]),
+            flags=["END_HEADERS"],
+        ).serialize(),
+        hyperframe.frame.DataFrame(stream_id=1, data=b"first").serialize(),
+        hyperframe.frame.HeadersFrame(
+            stream_id=1,
+            data=hpack.Encoder().encode([(b"X-Checksum", b"first")]),
+            flags=["END_STREAM", "END_HEADERS"],
+        ).serialize(),
+        hyperframe.frame.HeadersFrame(
+            stream_id=3,
+            data=hpack.Encoder().encode([(b":status", b"200")]),
+            flags=["END_HEADERS"],
+        ).serialize(),
+        hyperframe.frame.DataFrame(
+            stream_id=3, data=b"second", flags=["END_STREAM"]
+        ).serialize(),
+    ]
+    stream = httpcore.MockStream(frames)
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/1") as response:
+            assert response.read() == b"first"
+            assert response.trailers == [(b"X-Checksum", b"first")]
+
+        response = conn.request("GET", "https://example.com/2")
+        assert response.content == b"second"
+        assert response.trailers == []
+        assert conn.is_idle()
+
+
+
+def test_http2_trailers_multiple_chunks_and_repeated_values():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = _trailer_stream(
+        [b"abc", b"de"],
+        [(b"X-Checksum", b"first"), (b"X-Checksum", b"second")],
+    )
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            chunks = []
+            for chunk in response.iter_stream():
+                chunks.append(chunk)
+                assert response.trailers is None
+            assert chunks == [b"abc", b"de"]
+            assert response.trailers == [
+                (b"X-Checksum", b"first"),
+                (b"X-Checksum", b"second"),
+            ]
+        assert conn.is_idle()
+
+
+
+def test_http2_trailers_does_not_drain_body():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = _trailer_stream(
+        [b"abc", b"de"], [(b"X-Checksum", b"abcde")]
+    )
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            assert response.trailers is None
+            assert len(stream._buffer) == 3
+            iterator = response.iter_stream()
+            assert next(iterator) == b"abc"
+            assert response.trailers is None
+            assert len(stream._buffer) == 2
+            response.close()
+
+        assert conn.is_idle()
+        assert len(stream._buffer) == 2
+
+
+
+def test_http2_truncated_response():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    frames = [
+        hyperframe.frame.SettingsFrame().serialize(),
+        hyperframe.frame.HeadersFrame(
+            stream_id=1,
+            data=hpack.Encoder().encode([(b":status", b"200")]),
+            flags=["END_HEADERS"],
+        ).serialize(),
+        hyperframe.frame.DataFrame(stream_id=1, data=b"abc").serialize(),
+        hyperframe.frame.RstStreamFrame(stream_id=1, error_code=2).serialize(),
+    ]
+    stream = httpcore.MockStream(frames)
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            chunks = []
+            with pytest.raises(httpcore.RemoteProtocolError):
+                for chunk in response.iter_stream():
+                    chunks.append(chunk)
+            assert chunks == [b"abc"]
+            assert response.trailers is None
+
+
+
+def test_http2_forbidden_trailer_field():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = _trailer_stream([], [(b"Content-Length", b"0")])
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            with pytest.raises(httpcore.RemoteProtocolError):
+                response.read()
+            assert response.trailers is None
+        assert conn.is_closed()
+
+
+
+def test_http2_forbidden_pseudo_trailer_field():
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = _trailer_stream([], [(b":status", b"200")])
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            with pytest.raises(httpcore.RemoteProtocolError):
+                response.read()
+            assert response.trailers is None
+        assert conn.is_closed()

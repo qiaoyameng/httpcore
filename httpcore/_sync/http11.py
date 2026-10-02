@@ -20,6 +20,7 @@ from .._exceptions import (
 from .._models import Origin, Request, Response
 from .._synchronization import Lock, ShieldCancellation
 from .._trace import Trace
+from .._trailers import ResponseTrailers
 from .interfaces import ConnectionInterface
 
 logger = logging.getLogger("httpcore.http11")
@@ -57,6 +58,7 @@ class HTTP11Connection(ConnectionInterface):
         self._state = HTTPConnectionState.NEW
         self._state_lock = Lock()
         self._request_count = 0
+        self._response_protocol_error = False
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
             max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
@@ -117,12 +119,15 @@ class HTTP11Connection(ConnectionInterface):
             if (status == 101) or (
                 (request.method == b"CONNECT") and (200 <= status < 300)
             ):
-                network_stream = HTTP11UpgradeStream(network_stream, trailing_data)
+                network_stream = HTTP11UpgradeStream(
+                    network_stream, trailing_data
+                )
 
+            trailers = ResponseTrailers()
             return Response(
                 status=status,
                 headers=headers,
-                content=HTTP11ConnectionByteStream(self, request),
+                content=HTTP11ConnectionByteStream(self, request, trailers),
                 extensions={
                     "http_version": http_version,
                     "reason_phrase": reason_phrase,
@@ -194,7 +199,7 @@ class HTTP11Connection(ConnectionInterface):
         return http_version, event.status_code, event.reason, headers, trailing_data
 
     def _receive_response_body(
-        self, request: Request
+        self, request: Request, trailers: ResponseTrailers
     ) -> typing.Iterator[bytes]:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("read", None)
@@ -203,7 +208,14 @@ class HTTP11Connection(ConnectionInterface):
             event = self._receive_event(timeout=timeout)
             if isinstance(event, h11.Data):
                 yield bytes(event.data)
-            elif isinstance(event, (h11.EndOfMessage, h11.PAUSED)):
+            elif isinstance(event, h11.EndOfMessage):
+                try:
+                    trailers.set(event.headers.raw_items())
+                except RemoteProtocolError:
+                    self._response_protocol_error = True
+                    raise
+                break
+            elif event is h11.PAUSED:
                 break
 
     def _receive_event(
@@ -238,6 +250,8 @@ class HTTP11Connection(ConnectionInterface):
     def _response_closed(self) -> None:
         with self._state_lock:
             if (
+                not self._response_protocol_error
+                and
                 self._h11_state.our_state is h11.DONE
                 and self._h11_state.their_state is h11.DONE
             ):
@@ -322,16 +336,24 @@ class HTTP11Connection(ConnectionInterface):
 
 
 class HTTP11ConnectionByteStream:
-    def __init__(self, connection: HTTP11Connection, request: Request) -> None:
+    def __init__(
+        self,
+        connection: HTTP11Connection,
+        request: Request,
+        trailers: ResponseTrailers,
+    ) -> None:
         self._connection = connection
         self._request = request
+        self._trailers = trailers
         self._closed = False
 
     def __iter__(self) -> typing.Iterator[bytes]:
         kwargs = {"request": self._request}
         try:
             with Trace("receive_response_body", logger, self._request, kwargs):
-                for chunk in self._connection._receive_response_body(**kwargs):
+                for chunk in self._connection._receive_response_body(
+                    request=self._request, trailers=self._trailers
+                ):
                     yield chunk
         except BaseException as exc:
             # If we get an exception while streaming the response,

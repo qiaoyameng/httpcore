@@ -20,6 +20,7 @@ from .._exceptions import (
 from .._models import Origin, Request, Response
 from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
+from .._trailers import ResponseTrailers
 from .interfaces import AsyncConnectionInterface
 
 logger = logging.getLogger("httpcore.http11")
@@ -57,6 +58,7 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         self._state = HTTPConnectionState.NEW
         self._state_lock = AsyncLock()
         self._request_count = 0
+        self._response_protocol_error = False
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
             max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
@@ -117,12 +119,15 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
             if (status == 101) or (
                 (request.method == b"CONNECT") and (200 <= status < 300)
             ):
-                network_stream = AsyncHTTP11UpgradeStream(network_stream, trailing_data)
+                network_stream = AsyncHTTP11UpgradeStream(
+                    network_stream, trailing_data
+                )
 
+            trailers = ResponseTrailers()
             return Response(
                 status=status,
                 headers=headers,
-                content=HTTP11ConnectionByteStream(self, request),
+                content=HTTP11ConnectionByteStream(self, request, trailers),
                 extensions={
                     "http_version": http_version,
                     "reason_phrase": reason_phrase,
@@ -194,7 +199,7 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         return http_version, event.status_code, event.reason, headers, trailing_data
 
     async def _receive_response_body(
-        self, request: Request
+        self, request: Request, trailers: ResponseTrailers
     ) -> typing.AsyncIterator[bytes]:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("read", None)
@@ -203,7 +208,14 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
             event = await self._receive_event(timeout=timeout)
             if isinstance(event, h11.Data):
                 yield bytes(event.data)
-            elif isinstance(event, (h11.EndOfMessage, h11.PAUSED)):
+            elif isinstance(event, h11.EndOfMessage):
+                try:
+                    trailers.set(event.headers.raw_items())
+                except RemoteProtocolError:
+                    self._response_protocol_error = True
+                    raise
+                break
+            elif event is h11.PAUSED:
                 break
 
     async def _receive_event(
@@ -238,6 +250,8 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
     async def _response_closed(self) -> None:
         async with self._state_lock:
             if (
+                not self._response_protocol_error
+                and
                 self._h11_state.our_state is h11.DONE
                 and self._h11_state.their_state is h11.DONE
             ):
@@ -322,16 +336,24 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
 
 
 class HTTP11ConnectionByteStream:
-    def __init__(self, connection: AsyncHTTP11Connection, request: Request) -> None:
+    def __init__(
+        self,
+        connection: AsyncHTTP11Connection,
+        request: Request,
+        trailers: ResponseTrailers,
+    ) -> None:
         self._connection = connection
         self._request = request
+        self._trailers = trailers
         self._closed = False
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
         kwargs = {"request": self._request}
         try:
             async with Trace("receive_response_body", logger, self._request, kwargs):
-                async for chunk in self._connection._receive_response_body(**kwargs):
+                async for chunk in self._connection._receive_response_body(
+                    request=self._request, trailers=self._trailers
+                ):
                     yield chunk
         except BaseException as exc:
             # If we get an exception while streaming the response,

@@ -32,6 +32,30 @@ The interface is liberal in the types that it accepts, but specific in the prope
 
 ...
 
+HTTP/1.1 chunked responses and HTTP/2 responses may include trailer fields
+after the response body. Access `response.trailers` without reading any
+additional data:
+
+```python
+with httpcore.stream("GET", "https://www.example.com/") as response:
+    body = response.read()
+    trailers = response.trailers
+```
+
+`trailers` is `None` until the response body has reached its terminator. This
+includes the initial-headers phase, an early close, and a protocol error while
+reading the terminator. Once the complete response has been read, repeated
+queries return the same list. A response without trailer fields results in an
+empty list.
+
+The trailer list is a sequence of `(bytes, bytes)` pairs and preserves the
+field order and repeated values sent by the peer. Trailer fields are never
+included in `response.headers`, and accessing `response.trailers` does not
+read or buffer the remaining response body.
+
+Fields that must not be trailer fields are rejected consistently on HTTP/1.1
+and HTTP/2 with `httpcore.RemoteProtocolError`.
+
 ## URLs
 
 ...

@@ -5,6 +5,8 @@ import ssl
 import typing
 import urllib.parse
 
+from ._trailers import ResponseTrailers
+
 # Functions for typechecking...
 
 
@@ -416,6 +418,23 @@ class Response:
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} [{self.status}]>"
+
+    @property
+    def trailers(self) -> list[tuple[bytes, bytes]] | None:
+        """
+        Return the received trailer fields, preserving their wire order and
+        repeated values, or `None` if the response stream has not reached the
+        message terminator.
+
+        Accessing this property never reads from the network. If the stream is
+        closed early, or reading the terminator fails, it remains `None`.
+        A response with no trailer fields returns an empty list after the
+        complete response has been read.
+        """
+        trailer_state = getattr(self.stream, "_trailers", None)
+        if not isinstance(trailer_state, ResponseTrailers):
+            return None
+        return trailer_state.headers
 
     # Sync interface...
 

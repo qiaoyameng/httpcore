@@ -21,6 +21,7 @@ from .._exceptions import (
 from .._models import Origin, Request, Response
 from .._synchronization import Lock, Semaphore, ShieldCancellation
 from .._trace import Trace
+from .._trailers import ResponseTrailers
 from .interfaces import ConnectionInterface
 
 logger = logging.getLogger("httpcore.http2")
@@ -63,6 +64,7 @@ class HTTP2Connection(ConnectionInterface):
         self._sent_connection_init = False
         self._used_all_stream_ids = False
         self._connection_error = False
+        self._response_protocol_error = False
 
         # Mapping from stream ID to response stream events.
         self._events: dict[
@@ -70,6 +72,7 @@ class HTTP2Connection(ConnectionInterface):
             list[
                 h2.events.ResponseReceived
                 | h2.events.DataReceived
+                | h2.events.TrailersReceived
                 | h2.events.StreamEnded
                 | h2.events.StreamReset,
             ],
@@ -152,10 +155,13 @@ class HTTP2Connection(ConnectionInterface):
                 )
                 trace.return_value = (status, headers)
 
+            trailers = ResponseTrailers()
             return Response(
                 status=status,
                 headers=headers,
-                content=HTTP2ConnectionByteStream(self, request, stream_id=stream_id),
+                content=HTTP2ConnectionByteStream(
+                    self, request, stream_id=stream_id, trailers=trailers
+                ),
                 extensions={
                     "http_version": b"HTTP/2",
                     "network_stream": self._network_stream,
@@ -307,7 +313,10 @@ class HTTP2Connection(ConnectionInterface):
         return (status_code, headers)
 
     def _receive_response_body(
-        self, request: Request, stream_id: int
+        self,
+        request: Request,
+        stream_id: int,
+        trailers: ResponseTrailers,
     ) -> typing.Iterator[bytes]:
         """
         Iterator that returns the bytes of the response body for a given stream ID.
@@ -321,12 +330,25 @@ class HTTP2Connection(ConnectionInterface):
                 self._h2_state.acknowledge_received_data(amount, stream_id)
                 self._write_outgoing_data(request)
                 yield event.data
+            elif isinstance(event, h2.events.TrailersReceived):
+                try:
+                    trailers.set(event.headers)
+                except RemoteProtocolError:
+                    self._response_protocol_error = True
+                    raise
             elif isinstance(event, h2.events.StreamEnded):
+                if trailers.headers is None:
+                    trailers.set([])
                 break
 
     def _receive_stream_event(
         self, request: Request, stream_id: int
-    ) -> h2.events.ResponseReceived | h2.events.DataReceived | h2.events.StreamEnded:
+    ) -> (
+        h2.events.ResponseReceived
+        | h2.events.DataReceived
+        | h2.events.TrailersReceived
+        | h2.events.StreamEnded
+    ):
         """
         Return the next available event for a given stream ID.
 
@@ -375,6 +397,7 @@ class HTTP2Connection(ConnectionInterface):
                         (
                             h2.events.ResponseReceived,
                             h2.events.DataReceived,
+                            h2.events.TrailersReceived,
                             h2.events.StreamEnded,
                             h2.events.StreamReset,
                         ),
@@ -410,7 +433,9 @@ class HTTP2Connection(ConnectionInterface):
         self._max_streams_semaphore.release()
         del self._events[stream_id]
         with self._state_lock:
-            if self._connection_terminated and not self._events:
+            if self._response_protocol_error:
+                self.close()
+            elif self._connection_terminated and not self._events:
                 self.close()
 
             elif self._state == HTTPConnectionState.ACTIVE and not self._events:
@@ -561,11 +586,16 @@ class HTTP2Connection(ConnectionInterface):
 
 class HTTP2ConnectionByteStream:
     def __init__(
-        self, connection: HTTP2Connection, request: Request, stream_id: int
+        self,
+        connection: HTTP2Connection,
+        request: Request,
+        stream_id: int,
+        trailers: ResponseTrailers,
     ) -> None:
         self._connection = connection
         self._request = request
         self._stream_id = stream_id
+        self._trailers = trailers
         self._closed = False
 
     def __iter__(self) -> typing.Iterator[bytes]:
@@ -573,7 +603,9 @@ class HTTP2ConnectionByteStream:
         try:
             with Trace("receive_response_body", logger, self._request, kwargs):
                 for chunk in self._connection._receive_response_body(
-                    request=self._request, stream_id=self._stream_id
+                    request=self._request,
+                    stream_id=self._stream_id,
+                    trailers=self._trailers,
                 ):
                     yield chunk
         except BaseException as exc:
