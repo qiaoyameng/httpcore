@@ -18,6 +18,7 @@ from ._backends.base import (
 from ._backends.mock import AsyncMockBackend, AsyncMockStream, MockBackend, MockStream
 from ._backends.sync import SyncBackend
 from ._exceptions import (
+    CertificatePinError,
     ConnectError,
     ConnectionNotAvailable,
     ConnectTimeout,
@@ -115,6 +116,7 @@ __all__ = [
     "SOCKET_OPTION",
     # exceptions
     "ConnectionNotAvailable",
+    "CertificatePinError",
     "ProxyError",
     "ProtocolError",
     "LocalProtocolError",

@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Add per-request SHA-256 certificate pinning via the
+  `"ssl_certificate_pins"` request extension. Pinning supplements (rather
+  than replaces) standard CA/hostname verification, is enforced after the TLS
+  handshake but before request bytes are sent, binds pooled/HTTP-2
+  connections to the request's pin set, and pins the tunnel target (not the
+  proxy) when an HTTPS CONNECT proxy is in use. Raises `CertificatePinError`
+  on mismatch, on non-TLS requests, or when the backend exposes no peer
+  certificate.
 
 ## Version 1.0.9 (April 24th, 2025)
 

@@ -73,6 +73,14 @@ class ConnectError(NetworkError):
     pass
 
 
+class CertificatePinError(NetworkError):
+    """
+    The server certificate presented during the TLS handshake did not match
+    the set of pinned SHA-256 certificate fingerprints, or certificate pinning
+    was requested in a context where the server certificate is not available.
+    """
+
+
 class ReadError(NetworkError):
     pass
 

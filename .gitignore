@@ -10,3 +10,6 @@ venv*/
 .python-version
 build/
 dist/
+
+# Generated test TLS material for certificate pinning tests
+tests/certificates/*.pem

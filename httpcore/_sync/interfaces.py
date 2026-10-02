@@ -94,6 +94,16 @@ class ConnectionInterface(RequestInterface):
     def can_handle_request(self, origin: Origin) -> bool:
         raise NotImplementedError()  # pragma: nocover
 
+    def satisfies_pins(self, pins: frozenset[bytes] | None) -> bool:
+        """
+        Return `True` if the connection's TLS peer certificate satisfies
+        the given set of pinned SHA-256 certificate fingerprints.
+
+        A connection that was established for a plain HTTP (non-TLS) origin
+        can never satisfy a pin policy.
+        """
+        raise NotImplementedError()  # pragma: nocover
+
     def is_available(self) -> bool:
         """
         Return `True` if the connection is currently able to accept an

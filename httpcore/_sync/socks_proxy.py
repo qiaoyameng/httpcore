@@ -7,8 +7,13 @@ import socksio
 
 from .._backends.sync import SyncBackend
 from .._backends.base import NetworkBackend, NetworkStream
-from .._exceptions import ConnectionNotAvailable, ProxyError
+from .._exceptions import (
+    CertificatePinError,
+    ConnectionNotAvailable,
+    ProxyError,
+)
 from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
+from .._pins import enforce_certificate_pins, get_request_pins
 from .._ssl import default_ssl_context
 from .._synchronization import Lock
 from .._trace import Trace
@@ -197,6 +202,7 @@ class Socks5Connection(ConnectionInterface):
         http1: bool = True,
         http2: bool = False,
         network_backend: NetworkBackend | None = None,
+        pins: frozenset[bytes] | None = None,
     ) -> None:
         self._proxy_origin = proxy_origin
         self._remote_origin = remote_origin
@@ -212,11 +218,16 @@ class Socks5Connection(ConnectionInterface):
         self._connect_lock = Lock()
         self._connection: ConnectionInterface | None = None
         self._connect_failed = False
+        self._pins = pins
+        self._certificate_fingerprint: bytes | None = None
 
     def handle_request(self, request: Request) -> Response:
         timeouts = request.extensions.get("timeout", {})
         sni_hostname = request.extensions.get("sni_hostname", None)
         timeout = timeouts.get("connect", None)
+        pins = get_request_pins(request)
+        if self._pins is not None:
+            pins = self._pins if pins is None else pins & self._pins
 
         with self._connect_lock:
             if self._connection is None:
@@ -268,6 +279,9 @@ class Socks5Connection(ConnectionInterface):
 
                     # Determine if we should be using HTTP/1.1 or HTTP/2
                     ssl_object = stream.get_extra_info("ssl_object")
+                    self._certificate_fingerprint = enforce_certificate_pins(
+                        ssl_object, pins
+                    )
                     http2_negotiated = (
                         ssl_object is not None
                         and ssl_object.selected_alpn_protocol() == "h2"
@@ -295,8 +309,35 @@ class Socks5Connection(ConnectionInterface):
                     raise exc
             elif not self._connection.is_available():  # pragma: nocover
                 raise ConnectionNotAvailable()
+            else:
+                self._enforce_pins(pins)
 
         return self._connection.handle_request(request)
+
+    def _enforce_pins(self, pins: frozenset[bytes] | None) -> None:
+        if pins is None:
+            return
+        if self._certificate_fingerprint is None:
+            raise CertificatePinError(
+                "Certificate pinning was requested, but the network backend "
+                "could not provide the tunnel target's DER encoded "
+                "certificate."
+            )
+        if self._certificate_fingerprint not in pins:
+            raise CertificatePinError(
+                "Tunnel target certificate fingerprint "
+                f"{self._certificate_fingerprint.hex()} does not match any "
+                "pinned certificate."
+            )
+
+    def satisfies_pins(self, pins: frozenset[bytes] | None) -> bool:
+        if pins is None:
+            return True
+        if self._pins is not None and not (pins & self._pins):
+            return False
+        if self._certificate_fingerprint is not None:
+            return self._certificate_fingerprint in pins
+        return self._pins is not None
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._remote_origin

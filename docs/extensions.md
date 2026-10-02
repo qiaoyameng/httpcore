@@ -188,6 +188,44 @@ response = httpcore.request(
 )
 ```
 
+### `"ssl_certificate_pins"`
+
+A per-request set of SHA-256 certificate fingerprints that the server's
+certificate is required to match. Fingerprints may be given either as raw
+32 byte digests, or as 64 hex characters.
+
+Pinning is performed *in addition to* the standard certificate authority and
+hostname verification, never instead of it. The check runs after the TLS
+handshake has completed, but before any HTTP request bytes are written to the
+network. If the presented certificate does not match any of the pins then
+`httpcore.CertificatePinError` is raised.
+
+```python
+import hashlib
+import ssl
+import httpcore
+
+der_certificate = ssl.PEM_cert_to_DER_cert(open("cert.pem").read())
+fingerprint = hashlib.sha256(der_certificate).digest()
+
+response = httpcore.request(
+    "GET",
+    "https://www.example.com/",
+    extensions={"ssl_certificate_pins": {fingerprint}},
+)
+```
+
+Connections in a pool are bound to the pin policy of the request that
+established them: a reused keepalive connection is only considered when its
+presented certificate satisfies the current request's pins, and HTTP/2
+connections are only multiplexed between requests whose pins match.
+
+When connecting through an HTTPS-tunnelling proxy, the fingerprint is always
+computed from the *tunnel target* certificate, not the proxy's certificate.
+Pinning a plain (non-TLS) `http://` request is not possible and raises
+`CertificatePinError`, as is requesting pins from a network backend that
+cannot provide the peer's DER encoded certificate.
+
 ## Response Extensions
 
 ### `"http_version"`

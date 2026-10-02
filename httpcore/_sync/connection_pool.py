@@ -7,8 +7,13 @@ import typing
 
 from .._backends.sync import SyncBackend
 from .._backends.base import SOCKET_OPTION, NetworkBackend
-from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
+from .._exceptions import (
+    CertificatePinError,
+    ConnectionNotAvailable,
+    UnsupportedProtocol,
+)
 from .._models import Origin, Proxy, Request, Response
+from .._pins import get_request_pins
 from .._synchronization import Event, ShieldCancellation, ThreadLock
 from .connection import HTTPConnection
 from .interfaces import ConnectionInterface, RequestInterface
@@ -125,7 +130,9 @@ class ConnectionPool(RequestInterface):
         # in which case it is a no-op.
         self._optional_thread_lock = ThreadLock()
 
-    def create_connection(self, origin: Origin) -> ConnectionInterface:
+    def create_connection(
+        self, origin: Origin, pins: frozenset[bytes] | None = None
+    ) -> ConnectionInterface:
         if self._proxy is not None:
             if self._proxy.url.scheme in (b"socks5", b"socks5h"):
                 from .socks_proxy import Socks5Connection
@@ -135,6 +142,7 @@ class ConnectionPool(RequestInterface):
                     proxy_auth=self._proxy.auth,
                     remote_origin=origin,
                     ssl_context=self._ssl_context,
+                    pins=pins,
                     keepalive_expiry=self._keepalive_expiry,
                     http1=self._http1,
                     http2=self._http2,
@@ -148,6 +156,7 @@ class ConnectionPool(RequestInterface):
                     proxy_headers=self._proxy.headers,
                     proxy_ssl_context=self._proxy.ssl_context,
                     remote_origin=origin,
+                    pins=pins,
                     keepalive_expiry=self._keepalive_expiry,
                     network_backend=self._network_backend,
                 )
@@ -159,6 +168,7 @@ class ConnectionPool(RequestInterface):
                 proxy_ssl_context=self._proxy.ssl_context,
                 remote_origin=origin,
                 ssl_context=self._ssl_context,
+                pins=pins,
                 keepalive_expiry=self._keepalive_expiry,
                 http1=self._http1,
                 http2=self._http2,
@@ -168,6 +178,7 @@ class ConnectionPool(RequestInterface):
         return HTTPConnection(
             origin=origin,
             ssl_context=self._ssl_context,
+            pins=pins,
             keepalive_expiry=self._keepalive_expiry,
             http1=self._http1,
             http2=self._http2,
@@ -210,6 +221,12 @@ class ConnectionPool(RequestInterface):
         if scheme not in ("http", "https", "ws", "wss"):
             raise UnsupportedProtocol(
                 f"Request URL has an unsupported protocol '{scheme}://'."
+            )
+        pins = get_request_pins(request)
+        if pins is not None and scheme not in ("https", "wss"):
+            raise CertificatePinError(
+                "Certificate pinning requires a TLS connection, but the "
+                f"request URL uses the non-TLS scheme '{scheme}://'."
             )
 
         timeouts = request.extensions.get("timeout", {})
@@ -302,10 +319,13 @@ class ConnectionPool(RequestInterface):
         queued_requests = [request for request in self._requests if request.is_queued()]
         for pool_request in queued_requests:
             origin = pool_request.request.url.origin
+            pins = get_request_pins(pool_request.request)
             available_connections = [
                 connection
                 for connection in self._connections
-                if connection.can_handle_request(origin) and connection.is_available()
+                if connection.can_handle_request(origin)
+                and connection.is_available()
+                and connection.satisfies_pins(pins)
             ]
             idle_connections = [
                 connection for connection in self._connections if connection.is_idle()
@@ -323,16 +343,25 @@ class ConnectionPool(RequestInterface):
                 pool_request.assign_to_connection(connection)
             elif len(self._connections) < self._max_connections:
                 # log: "creating new connection"
-                connection = self.create_connection(origin)
+                connection = self.create_connection(origin, pins=pins)
                 self._connections.append(connection)
                 pool_request.assign_to_connection(connection)
             elif idle_connections:
                 # log: "closing idle connection"
-                connection = idle_connections[0]
+                compatible_idle_connections = [
+                    connection
+                    for connection in idle_connections
+                    if connection.satisfies_pins(pins)
+                ]
+                connection = (
+                    compatible_idle_connections[0]
+                    if compatible_idle_connections
+                    else idle_connections[0]
+                )
                 self._connections.remove(connection)
                 closing_connections.append(connection)
                 # log: "creating new connection"
-                connection = self.create_connection(origin)
+                connection = self.create_connection(origin, pins=pins)
                 self._connections.append(connection)
                 pool_request.assign_to_connection(connection)
 

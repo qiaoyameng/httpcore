@@ -6,7 +6,7 @@ import ssl
 import typing
 
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
-from .._exceptions import ProxyError
+from .._exceptions import CertificatePinError, ProxyError
 from .._models import (
     URL,
     Origin,
@@ -16,8 +16,13 @@ from .._models import (
     enforce_headers,
     enforce_url,
 )
+from .._pins import (
+    SSL_CERTIFICATE_PINS,
+    enforce_certificate_pins,
+    get_request_pins,
+)
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .connection import AsyncHTTPConnection
 from .connection_pool import AsyncConnectionPool
@@ -176,6 +181,7 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
         network_backend: AsyncNetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
         proxy_ssl_context: ssl.SSLContext | None = None,
+        pins: frozenset[bytes] | None = None,
     ) -> None:
         self._connection = AsyncHTTPConnection(
             origin=proxy_origin,
@@ -187,8 +193,15 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
         self._proxy_origin = proxy_origin
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
         self._remote_origin = remote_origin
+        self._pins = pins
 
     async def handle_async_request(self, request: Request) -> Response:
+        if get_request_pins(request) is not None or self._pins is not None:
+            raise CertificatePinError(
+                "Certificate pinning requires a TLS connection, but the "
+                "request to the remote origin is forwarded unencrypted by a "
+                "plain HTTP proxy."
+            )
         headers = merge_headers(self._proxy_headers, request.headers)
         url = URL(
             scheme=self._proxy_origin.scheme,
@@ -207,6 +220,9 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._remote_origin
+
+    def satisfies_pins(self, pins: frozenset[bytes] | None) -> bool:
+        return pins is None
 
     async def aclose(self) -> None:
         await self._connection.aclose()
@@ -243,6 +259,7 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         http2: bool = False,
         network_backend: AsyncNetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        pins: frozenset[bytes] | None = None,
     ) -> None:
         self._connection: AsyncConnectionInterface = AsyncHTTPConnection(
             origin=proxy_origin,
@@ -261,10 +278,15 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         self._http2 = http2
         self._connect_lock = AsyncLock()
         self._connected = False
+        self._pins = pins
+        self._certificate_fingerprint: bytes | None = None
 
     async def handle_async_request(self, request: Request) -> Response:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("connect", None)
+        pins = get_request_pins(request)
+        if self._pins is not None:
+            pins = self._pins if pins is None else pins & self._pins
 
         async with self._connect_lock:
             if not self._connected:
@@ -283,7 +305,11 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
                     method=b"CONNECT",
                     url=connect_url,
                     headers=connect_headers,
-                    extensions=request.extensions,
+                    extensions={
+                        key: value
+                        for key, value in request.extensions.items()
+                        if key != SSL_CERTIFICATE_PINS
+                    },
                 )
                 connect_response = await self._connection.handle_async_request(
                     connect_request
@@ -318,6 +344,16 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
 
                 # Determine if we should be using HTTP/1.1 or HTTP/2
                 ssl_object = stream.get_extra_info("ssl_object")
+                try:
+                    self._certificate_fingerprint = enforce_certificate_pins(
+                        ssl_object, pins
+                    )
+                except BaseException:
+                    # Handshake completed but the pin did not match; close
+                    # before any request bytes can be written to the target.
+                    with AsyncShieldCancellation():
+                        await stream.aclose()
+                    raise
                 http2_negotiated = (
                     ssl_object is not None
                     and ssl_object.selected_alpn_protocol() == "h2"
@@ -340,7 +376,34 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
                     )
 
                 self._connected = True
+            else:
+                self._enforce_pins(pins)
         return await self._connection.handle_async_request(request)
+
+    def _enforce_pins(self, pins: frozenset[bytes] | None) -> None:
+        if pins is None:
+            return
+        if self._certificate_fingerprint is None:
+            raise CertificatePinError(
+                "Certificate pinning was requested, but the network backend "
+                "could not provide the tunnel target's DER encoded "
+                "certificate."
+            )
+        if self._certificate_fingerprint not in pins:
+            raise CertificatePinError(
+                "Tunnel target certificate fingerprint "
+                f"{self._certificate_fingerprint.hex()} does not match any "
+                "pinned certificate."
+            )
+
+    def satisfies_pins(self, pins: frozenset[bytes] | None) -> bool:
+        if pins is None:
+            return True
+        if self._pins is not None and not (pins & self._pins):
+            return False
+        if self._certificate_fingerprint is not None:
+            return self._certificate_fingerprint in pins
+        return self._pins is not None
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._remote_origin

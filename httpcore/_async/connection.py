@@ -8,10 +8,14 @@ import typing
 
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
-from .._exceptions import ConnectError, ConnectTimeout
+from .._exceptions import CertificatePinError, ConnectError, ConnectTimeout
 from .._models import Origin, Request, Response
+from .._pins import (
+    enforce_certificate_pins,
+    get_request_pins,
+)
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .http11 import AsyncHTTP11Connection
 from .interfaces import AsyncConnectionInterface
@@ -48,6 +52,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         uds: str | None = None,
         network_backend: AsyncNetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        pins: frozenset[bytes] | None = None,
     ) -> None:
         self._origin = origin
         self._ssl_context = ssl_context
@@ -65,11 +70,25 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         self._connect_failed: bool = False
         self._request_lock = AsyncLock()
         self._socket_options = socket_options
+        # The certificate pin policy this connection was established to
+        # satisfy, when it has been created by a pool for a pinned request.
+        self._pins = pins
+        # The SHA-256 fingerprint of the presented DER certificate, recorded
+        # once the TLS handshake has completed.
+        self._certificate_fingerprint: bytes | None = None
 
     async def handle_async_request(self, request: Request) -> Response:
         if not self.can_handle_request(request.url.origin):
             raise RuntimeError(
                 f"Attempted to send request to {request.url.origin} on connection to {self._origin}"
+            )
+
+        pins = self._get_effective_pins(request)
+        if pins is not None and self._origin.scheme not in (b"https", b"wss"):
+            raise CertificatePinError(
+                "Certificate pinning requires a TLS connection, but the "
+                f"connection origin uses the non-TLS scheme "
+                f"{self._origin.scheme.decode('ascii')!r}."
             )
 
         try:
@@ -78,6 +97,17 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                     stream = await self._connect(request)
 
                     ssl_object = stream.get_extra_info("ssl_object")
+                    try:
+                        self._certificate_fingerprint = (
+                            enforce_certificate_pins(ssl_object, pins)
+                        )
+                    except BaseException:
+                        # The pin check occurs after the TLS handshake but
+                        # before any request bytes are written, so close the
+                        # freshly established stream rather than leaking it.
+                        with AsyncShieldCancellation():
+                            await stream.aclose()
+                        raise
                     http2_negotiated = (
                         ssl_object is not None
                         and ssl_object.selected_alpn_protocol() == "h2"
@@ -96,11 +126,55 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
                         )
+                else:
+                    self._enforce_pins(pins)
         except BaseException as exc:
             self._connect_failed = True
             raise exc
 
         return await self._connection.handle_async_request(request)
+
+    def _get_effective_pins(self, request: Request) -> frozenset[bytes] | None:
+        pins = get_request_pins(request)
+        if self._pins is not None:
+            # Connections created by a pool are bound to a specific pin
+            # policy. The per-request pins must always be a subset of it.
+            pins = self._pins if pins is None else pins & self._pins
+        return pins
+
+    def _enforce_pins(self, pins: frozenset[bytes] | None) -> None:
+        if pins is None:
+            return
+        if self._certificate_fingerprint is None:
+            raise CertificatePinError(
+                "Certificate pinning was requested, but the network backend "
+                "could not provide the server's DER encoded certificate."
+            )
+        if self._certificate_fingerprint not in pins:
+            raise CertificatePinError(
+                "Server certificate fingerprint "
+                f"{self._certificate_fingerprint.hex()} does not match any "
+                "pinned certificate."
+            )
+
+    def satisfies_pins(self, pins: frozenset[bytes] | None) -> bool:
+        """
+        Return `True` if this connection can service a request with the given
+        certificate pin policy.
+        """
+        if pins is None:
+            return True
+        if self._pins is not None and not (pins & self._pins):
+            return False
+        if self._certificate_fingerprint is not None:
+            return self._certificate_fingerprint in pins
+        if self._connection is not None:
+            # An established connection without a recorded fingerprint is
+            # not TLS, or the backend cannot expose the certificate.
+            return False
+        # An unconnected connection is safe to reuse only when it was created
+        # specifically for this pin policy.
+        return self._pins is not None
 
     async def _connect(self, request: Request) -> AsyncNetworkStream:
         timeouts = request.extensions.get("timeout", {})
